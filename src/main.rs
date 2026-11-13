@@ -17,6 +17,7 @@ mod run_loop;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("--version") => println!("{}", version_string()),
         Some("spike") => spike().await?,
         Some("run") => match args.get(2) {
             Some(issue_ref) => run_loop::run(issue_ref).await?,
@@ -27,11 +28,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         _ => {
             println!("actmaton (M0 seed)");
-            println!("usage: actmaton spike              # run the Copilot SDK hello-world spike");
+            println!("usage: actmaton --version          # print the actmaton version");
+            println!("       actmaton spike              # run the Copilot SDK hello-world spike");
             println!("       actmaton run <issue|url>    # run the M0 loop for one GitHub issue");
         }
     }
     Ok(())
+}
+
+fn version_string() -> String {
+    format!("actmaton {}", env!("CARGO_PKG_VERSION"))
 }
 
 async fn spike() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,6 +65,11 @@ async fn spike() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn version_string_matches_cargo() {
+        assert_eq!(super::version_string(), "actmaton 0.1.0");
+    }
+
     #[test]
     fn trivial_arithmetic() {
         assert_eq!(2 + 2, 4);
