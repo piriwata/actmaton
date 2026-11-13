@@ -223,7 +223,7 @@ fn scoped_permission(root: &Path, data: &PermissionRequestData) -> bool {
         .unwrap_or_else(|| data.extra.clone());
     let (allowed, detail) = match data.kind {
         Some(PermissionRequestKind::Write) | Some(PermissionRequestKind::Read) => {
-            match payload.get("path").and_then(Value::as_str) {
+            match payload_target_path(&payload) {
                 Some(p) => (path_within(root, Path::new(p)), format!("path={p}")),
                 None => (false, format!("no path in payload: {payload}")),
             }
@@ -257,6 +257,16 @@ fn scoped_permission(root: &Path, data: &PermissionRequestData) -> bool {
 }
 
 /// Is `candidate` (possibly relative to `root`) inside `root`?
+/// Extract the target file path from a read/write permission payload.
+/// Read requests carry it as `path`; write requests from the Copilot SDK
+/// carry it as `fileName`. Both go through the same worktree scoping.
+fn payload_target_path(payload: &Value) -> Option<&str> {
+    payload
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("fileName").and_then(Value::as_str))
+}
+
 fn path_within(root: &Path, candidate: &Path) -> bool {
     let abs = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -351,6 +361,17 @@ mod tests {
             3
         );
         assert!(parse_issue_ref("nope").is_err());
+    }
+
+    #[test]
+    fn payload_target_path_accepts_path_and_file_name() {
+        let read = serde_json::json!({"path": "/wt/src/main.rs"});
+        assert_eq!(payload_target_path(&read), Some("/wt/src/main.rs"));
+        // Write requests from the Copilot SDK use `fileName`, not `path`.
+        let write = serde_json::json!({"fileName": "/wt/src/run_loop.rs"});
+        assert_eq!(payload_target_path(&write), Some("/wt/src/run_loop.rs"));
+        let neither = serde_json::json!({"command": "ls"});
+        assert_eq!(payload_target_path(&neither), None);
     }
 
     #[test]
