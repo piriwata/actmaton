@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 github-copilot-sdk = "1.0.32"
+serde_json = "1"
 tokio = { version = "1.54.1", features = ["full"] }

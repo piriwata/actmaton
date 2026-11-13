@@ -7,6 +7,7 @@ name = "actmaton"
 version = "0.1.0"
 dependencies = [
  "github-copilot-sdk",
+ "serde_json",
  "tokio",
 ]
 
