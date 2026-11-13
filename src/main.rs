@@ -15,13 +15,20 @@ use github_copilot_sdk::{Client, ClientOptions, MessageOptions, SessionConfig};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("--version") => println!("{}", version_string()),
         Some("spike") => spike().await?,
         _ => {
             println!("actmaton (M0 seed)");
-            println!("usage: actmaton spike   # run the Copilot SDK hello-world spike");
+            println!("usage: actmaton [--version] | spike");
+            println!("  --version   print the actmaton version");
+            println!("  spike       run the Copilot SDK hello-world spike");
         }
     }
     Ok(())
+}
+
+fn version_string() -> String {
+    format!("actmaton {}", env!("CARGO_PKG_VERSION"))
 }
 
 async fn spike() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,6 +56,11 @@ async fn spike() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn version_string_matches_cargo() {
+        assert_eq!(super::version_string(), "actmaton 0.1.0");
+    }
+
     #[test]
     fn trivial_arithmetic() {
         assert_eq!(2 + 2, 4);
