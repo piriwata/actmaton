@@ -11,17 +11,26 @@ use std::time::Duration;
 use github_copilot_sdk::handler::ApproveAllHandler;
 use github_copilot_sdk::{Client, ClientOptions, MessageOptions, SessionConfig};
 
+mod run_loop;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("--version") => println!("{}", version_string()),
         Some("spike") => spike().await?,
+        Some("run") => match args.get(2) {
+            Some(issue_ref) => run_loop::run(issue_ref).await?,
+            None => {
+                eprintln!("usage: actmaton run <issue-number-or-url>");
+                std::process::exit(2);
+            }
+        },
         _ => {
             println!("actmaton (M0 seed)");
-            println!("usage: actmaton [--version] | spike");
-            println!("  --version   print the actmaton version");
-            println!("  spike       run the Copilot SDK hello-world spike");
+            println!("usage: actmaton --version          # print the actmaton version");
+            println!("       actmaton spike              # run the Copilot SDK hello-world spike");
+            println!("       actmaton run <issue|url>    # run the M0 loop for one GitHub issue");
         }
     }
     Ok(())
