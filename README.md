@@ -3,7 +3,7 @@
 
 Actmaton is a local-first, always-on development orchestrator that puts otherwise idle computing power—like a Mac at home overnight—to work. It uses local models for implementation and testing, and powerful cloud models for planning and difficult decisions, keeping development moving while optimizing cloud LLM costs. Humans steer the product through periodic feedback rather than approving every task.
 
-That is the long-term vision. Development, however, is prioritised by the shortest path to a narrower and more interesting goal: **Actmaton improving Actmaton itself.** The first loop therefore starts with a cloud model, targets only this repository, and relies on human review before anything is merged. Local-model support is deliberately not a blocker for that first loop.
+Actmaton's goal is to become a good autonomous coding agent. Actmaton improving Actmaton itself is not that goal — it is the story: a dogfooding route that puts the agent to work on a real codebase, its own, from the very beginning. Development is therefore ordered by the shortest path to that first self-improvement loop, because a loop that can improve Actmaton is strong evidence that the underlying autonomous coding agent works. The first loop starts with a cloud model, targets only this repository, and relies on human review before anything is merged. Local-model support is deliberately not a blocker for that first loop.
 
 ## How it works
 
@@ -20,7 +20,7 @@ The initial target is a **16 GB Apple Silicon Mac mini or MacBook**, using [TUFF
 
 ## Roadmap
 
-The roadmap is ordered by the shortest path to Actmaton improving Actmaton itself, rather than by building a general-purpose agent in full first.
+The roadmap serves the goal above — a good autonomous coding agent. It is ordered by the shortest path to the self-improvement story, with Actmaton working on Actmaton as an early, end-to-end proof of the agent loop on a real codebase, rather than as the goal itself.
 
 Early safety relies on simple guardrails instead of a complete autonomy framework:
 
