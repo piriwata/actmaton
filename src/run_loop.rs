@@ -90,15 +90,46 @@ pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::erro
         return Ok(());
     }
 
+    let outcome = execute(&issue, &repo_root).await?;
+    println!("next step: review the worktree, then commit/push/open a PR manually.");
+    println!("=============================================");
+
+    if !outcome.tests_ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Result of one full run of an issue (worktree, session, verification).
+pub(crate) struct Outcome {
+    pub title: String,
+    pub url: String,
+    pub branch: String,
+    pub worktree: PathBuf,
+    pub tests_ok: bool,
+    pub final_message: Option<String>,
+    pub log_path: PathBuf,
+}
+
+/// Run an issue by number: fetch it (fresh, so new comments are honored)
+/// and execute it.
+pub(crate) async fn run_number(number: u64) -> Result<Outcome, Box<dyn std::error::Error>> {
+    let repo_root = repo_root()?;
+    let issue = fetch_issue(number)?;
+    execute(&issue, &repo_root).await
+}
+
+async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std::error::Error>> {
+    let number = issue.number;
     let log: RunLog = Arc::new(Mutex::new(Vec::new()));
     log_line(&log, format!("issue #{}: {} ({})", issue.number, issue.title, issue.url));
 
-    let (branch, worktree) = setup_worktree(&repo_root, number)?;
+    let (branch, worktree) = setup_worktree(repo_root, number)?;
     println!("branch:   {branch}");
     println!("worktree: {}", worktree.display());
     log_line(&log, format!("worktree created: {} (branch {branch})", worktree.display()));
 
-    let mut final_message = run_session(&issue, build_prompt(&issue), &worktree, &log).await?;
+    let mut final_message = run_session(issue, build_prompt(issue), &worktree, &log).await?;
 
     // Post-session verification, run by us (not the agent).
     log_line(&log, "running cargo test in worktree".to_string());
@@ -108,8 +139,8 @@ pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::erro
         attempts = attempt;
         println!("cargo test failed; repair attempt {attempt}/{MAX_REPAIR_ATTEMPTS}");
         log_line(&log, format!("repair attempt {attempt}/{MAX_REPAIR_ATTEMPTS}: starting follow-up session"));
-        let prompt = build_repair_prompt(&issue, attempt, &test_tail);
-        let reply = run_session(&issue, prompt, &worktree, &log).await?;
+        let prompt = build_repair_prompt(issue, attempt, &test_tail);
+        let reply = run_session(issue, prompt, &worktree, &log).await?;
         let summary = one_line_summary(reply.as_deref());
         if reply.is_some() {
             final_message = reply;
@@ -130,8 +161,8 @@ pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::erro
     let diff_stat = git(&worktree, &["diff", "--stat", "HEAD"])?;
 
     let log_path = write_run_log(
-        &repo_root,
-        &issue,
+        repo_root,
+        issue,
         &log,
         final_message.as_deref(),
         &diff_stat,
@@ -152,13 +183,16 @@ pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::erro
     println!("{}", if diff_stat.trim().is_empty() { "  (none)" } else { &diff_stat });
     println!("cargo test: {}", if tests_ok { "PASS" } else { "FAIL" });
     println!("--- cargo test output (tail) ---\n{test_tail}");
-    println!("next step: review the worktree, then commit/push/open a PR manually.");
-    println!("=============================================");
 
-    if !tests_ok {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(Outcome {
+        title: issue.title.clone(),
+        url: issue.url.clone(),
+        branch,
+        worktree,
+        tests_ok,
+        final_message,
+        log_path,
+    })
 }
 
 /// Accept `3`, `#3`, or a full issue URL (`.../issues/3`).
@@ -764,7 +798,7 @@ fn shell_allowed(root: &Path, cmd: &str) -> bool {
 // Small process helpers
 // ---------------------------------------------------------------------------
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let out = Command::new("git").args(args).current_dir(dir).output()?;
     if !out.status.success() {
         return Err(format!(
