@@ -829,6 +829,42 @@ mod tests {
         assert_eq!(final_message_text(&other), None);
     }
 
+    fn event_with_data(data: serde_json::Value) -> SessionEvent {
+        serde_json::from_value(serde_json::json!({
+            "id": "1", "timestamp": "t", "parentId": null,
+            "type": "assistant.message", "data": data
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn final_message_text_returns_empty_string_for_empty_content() {
+        let event = event_with_data(serde_json::json!({"content": ""}));
+        assert_eq!(final_message_text(&event), Some(String::new()));
+    }
+
+    #[test]
+    fn final_message_text_ignores_missing_or_non_string_content() {
+        let missing = event_with_data(serde_json::json!({"other": "x"}));
+        assert_eq!(final_message_text(&missing), None);
+        let null = event_with_data(serde_json::json!({"content": null}));
+        assert_eq!(final_message_text(&null), None);
+        let number = event_with_data(serde_json::json!({"content": 5}));
+        assert_eq!(final_message_text(&number), None);
+    }
+
+    #[test]
+    fn final_message_text_uses_content_not_other_fields_and_keeps_text_verbatim() {
+        let event = event_with_data(serde_json::json!({
+            "message": "wrong",
+            "content": "  line one\n\nline two  "
+        }));
+        assert_eq!(
+            final_message_text(&event).as_deref(),
+            Some("  line one\n\nline two  ")
+        );
+    }
+
     #[test]
     fn payload_target_path_accepts_path_and_file_name() {
         let read = serde_json::json!({"path": "/wt/src/main.rs"});
