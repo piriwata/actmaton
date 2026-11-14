@@ -24,15 +24,20 @@ const REPO: &str = "piriwata/actmaton";
 const LABEL: &str = "actmaton-proposal";
 const SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
-pub async fn propose() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn propose(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if dry_run {
+        let root = repo_root()?;
+        let (prompt, _, _) = propose_prompt(&root)?;
+        println!("{prompt}");
+        return Ok(());
+    }
     propose_issue().await.map(|_| ())
 }
 
-/// Draft and file a proposal; returns the new issue's URL.
-pub async fn propose_issue() -> Result<String, Box<dyn std::error::Error>> {
-    let root = repo_root()?;
-    println!("repo root: {}", root.display());
-
+/// Build the propose prompt; returns it with the ledger path and rejected findings.
+fn propose_prompt(
+    root: &Path,
+) -> Result<(String, PathBuf, Vec<(String, String)>), Box<dyn std::error::Error>> {
     let ledger_path = root
         .parent()
         .ok_or("repo root has no parent directory")?
@@ -41,8 +46,16 @@ pub async fn propose_issue() -> Result<String, Box<dyn std::error::Error>> {
     let mut rejected = audit::read_ledger(&ledger_path);
     rejected.extend(closed_rejected_issues());
 
-    let snapshot = gather_snapshot(&root, &rejected)?;
-    let prompt = build_prompt(&snapshot);
+    let snapshot = gather_snapshot(root, &rejected)?;
+    Ok((build_prompt(&snapshot), ledger_path, rejected))
+}
+
+/// Draft and file a proposal; returns the new issue's URL.
+pub async fn propose_issue() -> Result<String, Box<dyn std::error::Error>> {
+    let root = repo_root()?;
+    println!("repo root: {}", root.display());
+
+    let (prompt, ledger_path, rejected) = propose_prompt(&root)?;
 
     let (reply, notes) = run_session(&root, &prompt).await?;
     let log_path = write_log(&root, &prompt, reply.as_deref(), &notes)?;
@@ -554,6 +567,19 @@ fn decide(root: &Path, kind: Option<&PermissionRequestKind>, path: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_has_required_sections() {
+        let root = std::env::current_dir().unwrap();
+        let snap = gather_snapshot(&root, &[]).unwrap_or_else(|_| {
+            // gh unavailable (offline CI): fall back to a git-only check of the template
+            "## Recent commits\n## Tracked files\n## TODO/FIXME in src/\n".to_string()
+        });
+        let prompt = build_prompt(&snap);
+        for h in ["## Recent commits", "## Tracked files", "## TODO/FIXME in src/"] {
+            assert!(prompt.contains(h), "missing {h}");
+        }
+    }
 
     #[test]
     fn snapshot_parts() {

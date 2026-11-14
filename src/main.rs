@@ -33,7 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(2);
             }
         },
-        Some("propose") => propose::propose().await?,
+        Some("propose") => {
+            let dry_run = args[2..].iter().any(|a| a == "--dry-run");
+            propose::propose(dry_run).await?
+        }
         Some("loop") => loop_cmd::run_loop(&args[2..]).await?,
         _ => println!("{USAGE}"),
     }
@@ -46,6 +49,7 @@ usage: actmaton --version          # print the actmaton version
        actmaton run <issue|url>    # run the M0 loop for one GitHub issue
        actmaton run <issue|url> --dry-run  # print prompt and permission policy; no model call
        actmaton propose            # draft the next task as an actmaton-proposal issue
+       actmaton propose --dry-run  # print the propose prompt; no model call, no issue created
        actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N]
                                    # autonomous loop: run oldest non-`hold` issue (or propose), push, open draft PR
 model selection (env vars; unset = auto): ACTMATON_MODEL, ACTMATON_FUSION_TIER (standard|high|max),
