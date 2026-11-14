@@ -12,9 +12,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::{
     Client, ClientOptions, MessageOptions, PermissionRequestData, PermissionRequestKind,
-    SessionConfig, SessionEvent,
+    RequestId, SessionConfig, SessionEvent, SessionId,
 };
 use serde_json::Value;
 
@@ -328,7 +329,9 @@ fn build_prompt(issue: &Issue) -> String {
 fn permission_policy_summary() -> &'static str {
     "- read/write: auto-approved only when the target path is inside the task worktree\n\
      - shell: auto-approved unless the command escapes the worktree \
-     (absolute paths outside it, `..` traversal, `git push`)\n\
+     (absolute paths outside it, `..` traversal, `git push`) or edits files \
+     through the shell (heredocs, redirection to files, `sed -i`, `tee`, `dd of=`); \
+     denials carry feedback telling the session what to do instead\n\
      - everything else (url, mcp, custom tools, memory, hooks): denied"
 }
 
@@ -349,11 +352,10 @@ async fn run_session(
         .create_session(
             SessionConfig::default()
                 .with_working_directory(worktree)
-                .approve_permissions_if(move |data| {
-                    let (allowed, line) = scoped_permission(&root, data);
-                    log_line(&perm_log, line);
-                    allowed
-                }),
+                .with_permission_handler(Arc::new(ScopedPermissionHandler {
+                    root,
+                    log: perm_log,
+                })),
         )
         .await?;
 
@@ -383,17 +385,74 @@ async fn run_session(
 // necessarily heuristic — see the M0 notes.
 // ---------------------------------------------------------------------------
 
-fn scoped_permission(root: &Path, data: &PermissionRequestData) -> (bool, String) {
+/// A permission decision. Denials carry feedback that is forwarded to the
+/// model (the SDK's reject feedback), so the session can recover — e.g.
+/// switch from a denied shell edit to the write tools — instead of giving
+/// up silently. This is a provisional guard: the real fix is OS-level
+/// sandboxing of tool execution; until that is available, deterministic
+/// detection + instructive denials keep runs from dying on the known
+/// failure mode (one giant shell heredoc that rewrites files).
+#[derive(Debug, PartialEq)]
+enum Decision {
+    Approve,
+    Deny(Option<String>),
+}
+
+const FEEDBACK_SHELL_EDIT: &str = "Denied by actmaton's permission policy: files must not be created or modified through shell commands (no heredocs, output redirection to files, sed -i, tee, or dd of=). Use the write/edit tools to change files, in small steps; use shell only for cargo build/test and read-only inspection.";
+const FEEDBACK_OUTSIDE_WORKTREE: &str = "Denied by actmaton's permission policy: that path is outside the task worktree. All reads and writes must stay inside the worktree.";
+const FEEDBACK_GIT_PUSH: &str =
+    "Denied by actmaton's permission policy: git push is not allowed during a run.";
+const FEEDBACK_ESCAPE: &str = "Denied by actmaton's permission policy: the command appears to escape the task worktree (absolute path outside it or `..` traversal). Work only inside the worktree.";
+const FEEDBACK_KIND: &str =
+    "Denied by actmaton's permission policy: this permission kind is not allowed during a run.";
+const FEEDBACK_NO_PATH: &str =
+    "Denied by actmaton's permission policy: the request carries no target path to scope.";
+
+struct ScopedPermissionHandler {
+    root: PathBuf,
+    log: RunLog,
+}
+
+#[async_trait::async_trait]
+impl PermissionHandler for ScopedPermissionHandler {
+    async fn handle(
+        &self,
+        _session_id: SessionId,
+        _request_id: RequestId,
+        data: PermissionRequestData,
+    ) -> PermissionResult {
+        let (decision, line) = scoped_permission(&self.root, &data);
+        log_line(&self.log, line);
+        match decision {
+            Decision::Approve => PermissionResult::approve_once(),
+            Decision::Deny(feedback) => PermissionResult::reject(feedback),
+        }
+    }
+}
+
+fn scoped_permission(root: &Path, data: &PermissionRequestData) -> (Decision, String) {
     let payload = data
         .extra
         .get("permissionRequest")
         .cloned()
         .unwrap_or_else(|| data.extra.clone());
-    let (allowed, detail) = match data.kind {
+    let (decision, detail) = match data.kind {
         Some(PermissionRequestKind::Write) | Some(PermissionRequestKind::Read) => {
             match payload_target_path(&payload) {
-                Some(p) => (path_within(root, Path::new(p)), format!("path={p}")),
-                None => (false, format!("no path in payload: {payload}")),
+                Some(p) => {
+                    if path_within(root, Path::new(p)) {
+                        (Decision::Approve, format!("path={p}"))
+                    } else {
+                        (
+                            Decision::Deny(Some(FEEDBACK_OUTSIDE_WORKTREE.to_string())),
+                            format!("path={p}"),
+                        )
+                    }
+                }
+                None => (
+                    Decision::Deny(Some(FEEDBACK_NO_PATH.to_string())),
+                    format!("no path in payload: {payload}"),
+                ),
             }
         }
         Some(PermissionRequestKind::Shell) => {
@@ -412,17 +471,102 @@ fn scoped_permission(root: &Path, data: &PermissionRequestData) -> (bool, String
                     _ => None,
                 })
                 .unwrap_or_default();
-            (shell_allowed(root, &cmd), format!("cmd={cmd}"))
+            (shell_decision(root, &cmd), format!("cmd={cmd}"))
         }
-        other => (false, format!("kind={other:?}")),
+        other => (
+            Decision::Deny(Some(FEEDBACK_KIND.to_string())),
+            format!("kind={other:?}"),
+        ),
     };
+    let allowed = decision == Decision::Approve;
     let line = format!(
         "[permission] {} kind={:?} {detail}",
         if allowed { "APPROVE" } else { "DENY" },
         data.kind
     );
     eprintln!("{line}");
-    (allowed, line)
+    (decision, line)
+}
+
+/// Decide a shell command. Order matters: the file-editing check comes
+/// first so its denial carries the actionable feedback (use the write
+/// tools), then the hard bans, then the worktree-escape heuristics.
+fn shell_decision(root: &Path, cmd: &str) -> Decision {
+    if shell_edit_attempt(cmd) {
+        return Decision::Deny(Some(FEEDBACK_SHELL_EDIT.to_string()));
+    }
+    if cmd.contains("git push") {
+        return Decision::Deny(Some(FEEDBACK_GIT_PUSH.to_string()));
+    }
+    if shell_allowed(root, cmd) {
+        Decision::Approve
+    } else {
+        Decision::Deny(Some(FEEDBACK_ESCAPE.to_string()))
+    }
+}
+
+/// Deterministic detection of shell commands that create or modify files:
+/// heredocs, output redirection to a file (other than /dev/null or an fd),
+/// `sed -i`, `tee`, and `dd of=`. These are exactly the shapes sessions
+/// reach for when they try to apply a whole implementation as one giant
+/// shell command — the recurring run failure mode. Read-only uses
+/// (`2>&1`, `>/dev/null`, `sed -n ...p`) stay allowed.
+fn shell_edit_attempt(cmd: &str) -> bool {
+    if cmd.contains("<<") {
+        return true; // heredoc or herestring
+    }
+    // Output redirection: find '>' (outside quotes) and inspect its target.
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+        if bytes[i] == b'>' && !in_single && !in_double {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'>' {
+                j += 1; // '>>'
+            }
+            while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                j += 1;
+            }
+            let start = j;
+            while j < bytes.len() && !(bytes[j] as char).is_whitespace() {
+                j += 1;
+            }
+            let target = &cmd[start..j];
+            if !target.is_empty() && !target.starts_with('&') && target != "/dev/null" {
+                return true;
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let has_word = |w: &str| {
+        tokens
+            .iter()
+            .any(|t| t.trim_matches(|c| matches!(c, ';' | '|' | '&' | '(' | ')')) == w)
+    };
+    if has_word("tee") || has_word("truncate") {
+        return true;
+    }
+    if has_word("sed")
+        && tokens
+            .iter()
+            .any(|t| *t == "-i" || t.starts_with("-i") || *t == "--in-place")
+    {
+        return true;
+    }
+    if has_word("dd") && tokens.iter().any(|t| t.starts_with("of=")) {
+        return true;
+    }
+    false
 }
 
 /// Is `candidate` (possibly relative to `root`) inside `root`?
@@ -520,6 +664,41 @@ fn cargo_test(dir: &Path) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_edit_attempt_detects_file_writes() {
+        // The recurring failure mode: implementation-as-heredoc.
+        assert!(shell_edit_attempt("python3 - <<'EOF'\nprint(1)\nEOF"));
+        assert!(shell_edit_attempt("cat > src/main.rs <<'EOF'\nx\nEOF"));
+        assert!(shell_edit_attempt("echo hello > out.txt"));
+        assert!(shell_edit_attempt("echo hello >> out.txt"));
+        assert!(shell_edit_attempt("cargo test 2>test.log"));
+        assert!(shell_edit_attempt("sed -i 's/a/b/' src/lib.rs"));
+        assert!(shell_edit_attempt("sed --in-place 's/a/b/' src/lib.rs"));
+        assert!(shell_edit_attempt("ls | tee files.txt"));
+        assert!(shell_edit_attempt("dd if=/dev/zero of=out.bin"));
+        // Read-only shapes stay allowed.
+        assert!(!shell_edit_attempt("cargo test"));
+        assert!(!shell_edit_attempt("cargo test 2>&1 | head -20"));
+        assert!(!shell_edit_attempt("echo warn >/dev/null"));
+        assert!(!shell_edit_attempt("grep -n 'a>b' src/lib.rs"));
+        assert!(!shell_edit_attempt("sed -n '1,5p' src/lib.rs"));
+        assert!(!shell_edit_attempt("git diff HEAD~1"));
+    }
+
+    #[test]
+    fn shell_decision_gives_actionable_feedback() {
+        let root = Path::new("/tmp/worktree");
+        match shell_decision(root, "python3 - <<'EOF'\nx\nEOF") {
+            Decision::Deny(Some(f)) => assert!(f.contains("write/edit tools")),
+            other => panic!("expected shell-edit denial, got {other:?}"),
+        }
+        match shell_decision(root, "git push origin main") {
+            Decision::Deny(Some(f)) => assert!(f.contains("git push")),
+            other => panic!("expected git-push denial, got {other:?}"),
+        }
+        assert_eq!(shell_decision(root, "cargo test"), Decision::Approve);
+    }
 
     #[test]
     fn leftover_decision_recreates_only_clean() {
