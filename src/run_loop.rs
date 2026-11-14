@@ -9,11 +9,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use github_copilot_sdk::{
     Client, ClientOptions, MessageOptions, PermissionRequestData, PermissionRequestKind,
-    SessionConfig,
+    SessionConfig, SessionEvent,
 };
 use serde_json::Value;
 
@@ -37,18 +38,36 @@ pub async fn run(issue_ref: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("issue #{}: {}", issue.number, issue.title);
     println!("         {}", issue.url);
 
+    let log: RunLog = Arc::new(Mutex::new(Vec::new()));
+    log_line(&log, format!("issue #{}: {} ({})", issue.number, issue.title, issue.url));
+
     let (branch, worktree) = setup_worktree(&repo_root, number)?;
     println!("branch:   {branch}");
     println!("worktree: {}", worktree.display());
+    log_line(&log, format!("worktree created: {} (branch {branch})", worktree.display()));
 
-    run_session(&issue, &worktree).await?;
+    let final_message = run_session(&issue, &worktree, &log).await?;
 
     // Post-session verification, run by us (not the agent).
     let status = git(&worktree, &["status", "--porcelain"])?;
     let diff_stat = git(&worktree, &["diff", "--stat", "HEAD"])?;
+    log_line(&log, "running cargo test in worktree".to_string());
     let (tests_ok, test_tail) = cargo_test(&worktree);
 
+    let log_path = write_run_log(
+        &repo_root,
+        &issue,
+        &log,
+        final_message.as_deref(),
+        &diff_stat,
+        tests_ok,
+        &test_tail,
+    )?;
+
     println!("\n================ run summary ================");
+    println!("final message:");
+    println!("{}", final_message.as_deref().unwrap_or("(no final message)"));
+    println!("run log:  {}", log_path.display());
     println!("issue:    #{} {}", issue.number, issue.title);
     println!("branch:   {branch}");
     println!("worktree: {}", worktree.display());
@@ -162,7 +181,61 @@ fn setup_worktree(
     Ok((branch, worktree))
 }
 
-async fn run_session(issue: &Issue, worktree: &Path) -> Result<(), Box<dyn std::error::Error>> {
+type RunLog = Arc<Mutex<Vec<String>>>;
+
+fn log_line(log: &RunLog, line: String) {
+    if let Ok(mut l) = log.lock() {
+        l.push(line);
+    }
+}
+
+/// Plain-text content of an assistant message event, if it has any.
+pub fn final_message_text(event: &SessionEvent) -> Option<String> {
+    event
+        .data
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Write the run log to `<repo-parent>/actmaton-runs/issue-<n>-<unix-ts>.log`.
+fn write_run_log(
+    repo_root: &Path,
+    issue: &Issue,
+    log: &RunLog,
+    final_message: Option<&str>,
+    diff_stat: &str,
+    tests_ok: bool,
+    test_tail: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = repo_root
+        .parent()
+        .ok_or("repo root has no parent directory")?
+        .join("actmaton-runs");
+    std::fs::create_dir_all(&dir)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let path = dir.join(format!("issue-{}-{ts}.log", issue.number));
+    let steps = log.lock().map(|l| l.join("\n")).unwrap_or_default();
+    let text = format!(
+        "issue #{} {}\n\n== steps and permission decisions ==\n{steps}\n\n\
+         == final message ==\n{}\n\n== diff --stat vs HEAD ==\n{diff_stat}\n\n\
+         == cargo test: {} ==\n{test_tail}\n",
+        issue.number,
+        issue.title,
+        final_message.unwrap_or("(no final message)"),
+        if tests_ok { "PASS" } else { "FAIL" },
+    );
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+async fn run_session(
+    issue: &Issue,
+    worktree: &Path,
+    log: &RunLog,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let prompt = format!(
         "You are implementing a GitHub issue in an isolated git worktree of the \
          actmaton repository. Your current working directory is the worktree root.\n\n\
@@ -181,24 +254,30 @@ async fn run_session(issue: &Issue, worktree: &Path) -> Result<(), Box<dyn std::
         .canonicalize()
         .unwrap_or_else(|_| worktree.to_path_buf());
 
+    let perm_log = log.clone();
     let client = Client::start(ClientOptions::default()).await?;
     let session = client
         .create_session(
             SessionConfig::default()
                 .with_working_directory(worktree)
-                .approve_permissions_if(move |data| scoped_permission(&root, data)),
+                .approve_permissions_if(move |data| {
+                    let (allowed, line) = scoped_permission(&root, data);
+                    log_line(&perm_log, line);
+                    allowed
+                }),
         )
         .await?;
 
     println!("copilot session started; sending task for issue #{}", issue.number);
+    log_line(log, "copilot session started; task sent".to_string());
     let reply = session
         .send_and_wait(MessageOptions::new(prompt).with_wait_timeout(SESSION_TIMEOUT))
         .await?;
-    println!("session finished. final reply: {reply:?}");
+    log_line(log, "session finished".to_string());
 
     session.disconnect().await?;
     client.stop().await.ok();
-    Ok(())
+    Ok(reply.as_ref().and_then(final_message_text))
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +294,7 @@ async fn run_session(issue: &Issue, worktree: &Path) -> Result<(), Box<dyn std::
 // necessarily heuristic — see the M0 notes.
 // ---------------------------------------------------------------------------
 
-fn scoped_permission(root: &Path, data: &PermissionRequestData) -> bool {
+fn scoped_permission(root: &Path, data: &PermissionRequestData) -> (bool, String) {
     let payload = data
         .extra
         .get("permissionRequest")
@@ -248,12 +327,13 @@ fn scoped_permission(root: &Path, data: &PermissionRequestData) -> bool {
         }
         other => (false, format!("kind={other:?}")),
     };
-    eprintln!(
+    let line = format!(
         "[permission] {} kind={:?} {detail}",
         if allowed { "APPROVE" } else { "DENY" },
         data.kind
     );
-    allowed
+    eprintln!("{line}");
+    (allowed, line)
 }
 
 /// Is `candidate` (possibly relative to `root`) inside `root`?
@@ -361,6 +441,25 @@ mod tests {
             3
         );
         assert!(parse_issue_ref("nope").is_err());
+    }
+
+    #[test]
+    fn final_message_text_extracts_content() {
+        let event: SessionEvent = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "parentId": null,
+            "type": "assistant.message",
+            "data": {"content": "All done."}
+        }))
+        .unwrap();
+        assert_eq!(final_message_text(&event).as_deref(), Some("All done."));
+        let other: SessionEvent = serde_json::from_value(serde_json::json!({
+            "id": "2", "timestamp": "t", "parentId": null,
+            "type": "session.idle", "data": {}
+        }))
+        .unwrap();
+        assert_eq!(final_message_text(&other), None);
     }
 
     #[test]

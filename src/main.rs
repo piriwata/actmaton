@@ -56,7 +56,10 @@ async fn spike() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    println!("reply: {reply:?}");
+    match reply.as_ref().and_then(run_loop::final_message_text) {
+        Some(text) => println!("reply: {text}"),
+        None => println!("reply: (no message)"),
+    }
 
     session.disconnect().await?;
     client.stop().await.ok();
