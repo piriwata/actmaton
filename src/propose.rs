@@ -563,6 +563,35 @@ mod tests {
     }
 
     #[test]
+    fn pub_fns_lists_public_fns_in_nested_dirs() {
+        let root = std::env::temp_dir().join(format!("actmaton-pub-fns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(
+            root.join("a.rs"),
+            "pub fn one() {}\npub async fn two() {}\npub(crate) fn hidden() {}\nfn private() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("sub/b.rs"), "    pub fn nested_fn(x: u8) {}\n").unwrap();
+        std::fs::write(root.join("sub/skip.txt"), "pub fn ignored() {}\n").unwrap();
+
+        let out = pub_fns(&root, &root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            out,
+            vec!["a.rs: one, two".to_string(), "sub/b.rs: nested_fn".to_string()]
+        );
+    }
+
+    #[test]
+    fn word_presence() {
+        assert!(is_word_present("Add a flag", &["add"]));
+        assert!(is_word_present("ADD, then run", &["add"]));
+        assert!(!is_word_present("fix the address", &["add"]));
+        assert!(!is_word_present("", &["add"]));
+    }
+
+    #[test]
     fn reference_check() {
         let usage = crate::USAGE;
         let exists = |p: &str| p == "src/main.rs";
