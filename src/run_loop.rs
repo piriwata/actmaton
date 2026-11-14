@@ -100,7 +100,7 @@ fn parse_issue_ref(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
         .map_err(|_| format!("cannot parse an issue number from `{s}`").into())
 }
 
-fn repo_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn repo_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let out = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()?;
@@ -340,14 +340,14 @@ fn scoped_permission(root: &Path, data: &PermissionRequestData) -> (bool, String
 /// Extract the target file path from a read/write permission payload.
 /// Read requests carry it as `path`; write requests from the Copilot SDK
 /// carry it as `fileName`. Both go through the same worktree scoping.
-fn payload_target_path(payload: &Value) -> Option<&str> {
+pub(crate) fn payload_target_path(payload: &Value) -> Option<&str> {
     payload
         .get("path")
         .and_then(Value::as_str)
         .or_else(|| payload.get("fileName").and_then(Value::as_str))
 }
 
-fn path_within(root: &Path, candidate: &Path) -> bool {
+pub(crate) fn path_within(root: &Path, candidate: &Path) -> bool {
     let abs = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
