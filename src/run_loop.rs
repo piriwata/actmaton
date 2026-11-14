@@ -29,7 +29,7 @@ struct Issue {
 }
 
 /// Entry point for `actmaton run <issue-number-or-url>`.
-pub async fn run(issue_ref: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     let number = parse_issue_ref(issue_ref)?;
     let repo_root = repo_root()?;
     println!("repo root: {}", repo_root.display());
@@ -37,6 +37,13 @@ pub async fn run(issue_ref: &str) -> Result<(), Box<dyn std::error::Error>> {
     let issue = fetch_issue(number)?;
     println!("issue #{}: {}", issue.number, issue.title);
     println!("         {}", issue.url);
+
+    if dry_run {
+        println!("\n== dry run: prompt ==\n{}", build_prompt(&issue));
+        println!("\n== dry run: permission policy ==\n{}", permission_policy_summary());
+        println!("\ndry run: no worktree or Copilot session created, no message sent.");
+        return Ok(());
+    }
 
     let log: RunLog = Arc::new(Mutex::new(Vec::new()));
     log_line(&log, format!("issue #{}: {} ({})", issue.number, issue.title, issue.url));
@@ -289,12 +296,9 @@ fn write_run_log(
     Ok(path)
 }
 
-async fn run_session(
-    issue: &Issue,
-    worktree: &Path,
-    log: &RunLog,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let prompt = format!(
+/// The exact prompt sent to the agent (shared by the real run and `--dry-run`).
+fn build_prompt(issue: &Issue) -> String {
+    format!(
         "You are implementing a GitHub issue in an isolated git worktree of the \
          actmaton repository. Your current working directory is the worktree root.\n\n\
          Issue #{number}: {title}\n\n{body}\n\n\
@@ -306,7 +310,23 @@ async fn run_session(
         number = issue.number,
         title = issue.title,
         body = issue.body,
-    );
+    )
+}
+
+/// Human-readable description of `scoped_permission`'s policy.
+fn permission_policy_summary() -> &'static str {
+    "- read/write: auto-approved only when the target path is inside the task worktree\n\
+     - shell: auto-approved unless the command escapes the worktree \
+     (absolute paths outside it, `..` traversal, `git push`)\n\
+     - everything else (url, mcp, custom tools, memory, hooks): denied"
+}
+
+async fn run_session(
+    issue: &Issue,
+    worktree: &Path,
+    log: &RunLog,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let prompt = build_prompt(issue);
 
     let root = worktree
         .canonicalize()
@@ -496,6 +516,21 @@ mod tests {
         assert!(matches!(leftover_decision(true, 0), Leftover::Refuse(_)));
         assert!(matches!(leftover_decision(false, 2), Leftover::Refuse(_)));
         assert!(matches!(leftover_decision(true, 2), Leftover::Refuse(_)));
+    }
+
+    #[test]
+    fn prompt_and_policy_summary() {
+        let issue = Issue {
+            number: 7,
+            title: "Do thing".into(),
+            body: "Body text".into(),
+            url: "u".into(),
+        };
+        let p = build_prompt(&issue);
+        assert!(p.contains("Issue #7: Do thing\n\nBody text"));
+        assert!(p.contains("Do NOT run git commit"));
+        let s = permission_policy_summary();
+        assert!(s.contains("read/write") && s.contains("shell") && s.contains("denied"));
     }
 
     #[test]
