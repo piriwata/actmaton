@@ -27,6 +27,45 @@ struct Issue {
     title: String,
     body: String,
     url: String,
+    comments: Vec<Comment>,
+}
+
+struct Comment {
+    author: String,
+    body: String,
+}
+
+const MAX_COMMENTS: usize = 20;
+const MAX_COMMENT_CHARS: usize = 2000;
+
+/// Chronological comments section (empty string when there are none),
+/// bounded to the last `MAX_COMMENTS` comments of `MAX_COMMENT_CHARS` each.
+fn comments_section(comments: &[Comment]) -> String {
+    if comments.is_empty() {
+        return String::new();
+    }
+    let skipped = comments.len().saturating_sub(MAX_COMMENTS);
+    let mut s = String::from(
+        "## Issue comments (chronological)\n\n\
+         These comments are part of the task input. Where a comment conflicts with the \
+         issue body above, the comment wins (it is later, human steering).\n\n",
+    );
+    if skipped > 0 {
+        s.push_str(&format!(
+            "[Note: {skipped} older comment(s) omitted; showing the last {MAX_COMMENTS}.]\n\n"
+        ));
+    }
+    for c in &comments[skipped..] {
+        let text = c.body.trim();
+        let truncated = text.chars().count() > MAX_COMMENT_CHARS;
+        let text: String = text.chars().take(MAX_COMMENT_CHARS).collect();
+        s.push_str(&format!("### @{}\n{}", c.author, text));
+        if truncated {
+            s.push_str(&format!("\n[comment truncated to {MAX_COMMENT_CHARS} characters]"));
+        }
+        s.push_str("\n\n");
+    }
+    s
 }
 
 /// Entry point for `actmaton run <issue-number-or-url>`.
@@ -127,7 +166,7 @@ fn fetch_issue(number: u64) -> Result<Issue, Box<dyn std::error::Error>> {
             "--repo",
             REPO,
             "--json",
-            "number,title,body,url,state",
+            "number,title,body,url,state,comments",
         ])
         .output()?;
     if !out.status.success() {
@@ -146,6 +185,17 @@ fn fetch_issue(number: u64) -> Result<Issue, Box<dyn std::error::Error>> {
         title: v["title"].as_str().unwrap_or_default().to_string(),
         body: v["body"].as_str().unwrap_or_default().to_string(),
         url: v["url"].as_str().unwrap_or_default().to_string(),
+        comments: v["comments"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|c| Comment {
+                        author: c["author"]["login"].as_str().unwrap_or("unknown").to_string(),
+                        body: c["body"].as_str().unwrap_or_default().to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -302,7 +352,7 @@ fn build_prompt(issue: &Issue) -> String {
     format!(
         "You are implementing a GitHub issue in an isolated git worktree of the \
          actmaton repository. Your current working directory is the worktree root.\n\n\
-         Issue #{number}: {title}\n\n{body}\n\n\
+         Issue #{number}: {title}\n\n{body}\n\n{comments}\
          Rules:\n\
          - Make all changes inside this worktree only. Do not read or write paths outside it.\n\
          - Do NOT run git commit, git push, or gh commands. Leave changes uncommitted.\n\
@@ -322,6 +372,7 @@ fn build_prompt(issue: &Issue) -> String {
         number = issue.number,
         title = issue.title,
         body = issue.body,
+        comments = comments_section(&issue.comments),
     )
 }
 
@@ -715,12 +766,37 @@ mod tests {
             title: "Do thing".into(),
             body: "Body text".into(),
             url: "u".into(),
+            comments: vec![],
         };
         let p = build_prompt(&issue);
+        assert!(!p.contains("Issue comments"));
         assert!(p.contains("Issue #7: Do thing\n\nBody text"));
         assert!(p.contains("Do NOT run git commit"));
         let s = permission_policy_summary();
         assert!(s.contains("read/write") && s.contains("shell") && s.contains("denied"));
+    }
+
+    #[test]
+    fn prompt_includes_and_bounds_comments() {
+        let mut comments: Vec<Comment> = (0..25)
+            .map(|i| Comment { author: "bob".into(), body: format!("c{i}x") })
+            .collect();
+        comments.push(Comment { author: "alice".into(), body: "y".repeat(5000) });
+        let issue = Issue {
+            number: 1,
+            title: "t".into(),
+            body: "b".into(),
+            url: "u".into(),
+            comments,
+        };
+        let p = build_prompt(&issue);
+        assert!(p.contains("## Issue comments (chronological)"));
+        assert!(p.contains("the comment wins"));
+        assert!(p.contains("6 older comment(s) omitted"));
+        assert!(!p.contains("c5x") && p.contains("c6x"));
+        assert!(p.contains("### @alice") && p.contains("[comment truncated"));
+        assert!(!p.contains(&"y".repeat(MAX_COMMENT_CHARS + 1)));
+        assert!(p.find("Issue comments").unwrap() < p.find("Rules:").unwrap());
     }
 
     #[test]
