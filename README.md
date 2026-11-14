@@ -18,8 +18,9 @@ GitHub Issues, PRs, and CI hold the backlog, decisions, and results. The initial
 
 ## Roadmap
 
-- **M0 — Seed:** the minimal agent loop, built from outside Actmaton: read one Issue, edit in a worktree, test, open a draft PR.
-- **M1 — First self-improvement:** Actmaton improves Actmaton itself; a human reviews and merges.
+- **Sandbox:** OS-level isolation for the agent's tool execution (no credentials, no network, worktree-only writes), so runs can go unattended.
 - **M2 — Self-proposal:** Actmaton files its own improvement Issues; a human selects.
 - **M3 — Repeated loop:** self-improvement becomes repeatable, with idempotency, bounded retries, and cost/time records.
 - **M4 — Autonomy and local models:** always-on operation, richer direction, and local model support for the 16 GB Apple Silicon target.
+
+Done: **M0 — Seed** (the minimal agent loop) and **M1 — First self-improvement** (Actmaton's own improvements now run through Actmaton itself; a human reviews and merges).
