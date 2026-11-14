@@ -35,6 +35,9 @@ struct Comment {
     body: String,
 }
 
+/// Follow-up sessions allowed after a failing post-run `cargo test`.
+const MAX_REPAIR_ATTEMPTS: u32 = 2;
+const MAX_TEST_OUTPUT_CHARS: usize = 6000;
 const MAX_COMMENTS: usize = 20;
 const MAX_COMMENT_CHARS: usize = 2000;
 
@@ -93,13 +96,36 @@ pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::erro
     println!("worktree: {}", worktree.display());
     log_line(&log, format!("worktree created: {} (branch {branch})", worktree.display()));
 
-    let final_message = run_session(&issue, &worktree, &log).await?;
+    let mut final_message = run_session(&issue, build_prompt(&issue), &worktree, &log).await?;
 
     // Post-session verification, run by us (not the agent).
+    log_line(&log, "running cargo test in worktree".to_string());
+    let (mut tests_ok, mut test_tail) = cargo_test(&worktree);
+    let mut attempts = 0;
+    while let RepairStep::Repair(attempt) = repair_decision(tests_ok, attempts) {
+        attempts = attempt;
+        println!("cargo test failed; repair attempt {attempt}/{MAX_REPAIR_ATTEMPTS}");
+        log_line(&log, format!("repair attempt {attempt}/{MAX_REPAIR_ATTEMPTS}: starting follow-up session"));
+        let prompt = build_repair_prompt(&issue, attempt, &test_tail);
+        let reply = run_session(&issue, prompt, &worktree, &log).await?;
+        let summary = one_line_summary(reply.as_deref());
+        if reply.is_some() {
+            final_message = reply;
+        }
+        (tests_ok, test_tail) = cargo_test(&worktree);
+        log_line(
+            &log,
+            format!(
+                "repair attempt {attempt}/{MAX_REPAIR_ATTEMPTS}: cargo test {}; session summary: {summary}",
+                if tests_ok { "PASS" } else { "FAIL" }
+            ),
+        );
+    }
+    if !tests_ok {
+        log_line(&log, format!("tests still failing after {attempts} repair attempt(s); keeping worktree"));
+    }
     let status = git(&worktree, &["status", "--porcelain"])?;
     let diff_stat = git(&worktree, &["diff", "--stat", "HEAD"])?;
-    log_line(&log, "running cargo test in worktree".to_string());
-    let (tests_ok, test_tail) = cargo_test(&worktree);
 
     let log_path = write_run_log(
         &repo_root,
@@ -358,6 +384,13 @@ fn build_prompt(issue: &Issue) -> String {
          - Do NOT run git commit, git push, or gh commands. Leave changes uncommitted.\n\
          - Keep the change minimal and focused on the issue's acceptance criteria.\n\
          - After implementing, run `cargo test` and make sure it passes before finishing.\n\n\
+         Surgical-change rules:\n\
+         - Prefer deletion over addition: if the task can be met by removing or simplifying code, do that.\n\
+         - Before writing new code, check whether the code (or a helper) already exists and reuse it.\n\
+         - Touch only what the task requires; every changed line must trace to the issue.\n\
+         - Remove only the orphans (unused imports/functions) your own change created.\n\
+         - Do not clean up, refactor, or reformat anything else; cleanup beyond the task's own \
+         orphans belongs in its own issue, not in this diff.\n\n\
          How to edit (important):\n\
          - Edit files ONLY with the write/edit tools, in small steps (one file or one function at a time).\n\
          - NEVER modify files through shell commands: no heredocs, no sed/awk/perl/python \
@@ -388,11 +421,10 @@ fn permission_policy_summary() -> &'static str {
 
 async fn run_session(
     issue: &Issue,
+    prompt: String,
     worktree: &Path,
     log: &RunLog,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let prompt = build_prompt(issue);
-
     let root = worktree
         .canonicalize()
         .unwrap_or_else(|_| worktree.to_path_buf());
@@ -699,14 +731,72 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> 
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
+/// Last `max` characters of `text`, on a line boundary, with a truncation marker.
+fn tail_chars(text: &str, max: usize) -> String {
+    let total = text.chars().count();
+    if total <= max {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(total - max).collect();
+    let tail = tail.split_once('\n').map_or(tail.as_str(), |(_, rest)| rest);
+    format!("[output truncated to the last part]\n{tail}")
+}
+
+/// One-line summary of a session's final message (its last non-empty line).
+fn one_line_summary(message: Option<&str>) -> String {
+    let line = message
+        .and_then(|m| m.lines().map(str::trim).rev().find(|l| !l.is_empty()))
+        .unwrap_or("(no final message)");
+    let mut s: String = line.chars().take(200).collect();
+    if line.chars().count() > 200 {
+        s.push('…');
+    }
+    s
+}
+
+/// What to do after a test run, given how many repair attempts were already made.
+#[derive(Debug, PartialEq)]
+enum RepairStep {
+    Done,
+    Repair(u32),
+    GiveUp,
+}
+
+fn repair_decision(tests_ok: bool, attempts_made: u32) -> RepairStep {
+    if tests_ok {
+        RepairStep::Done
+    } else if attempts_made < MAX_REPAIR_ATTEMPTS {
+        RepairStep::Repair(attempts_made + 1)
+    } else {
+        RepairStep::GiveUp
+    }
+}
+
+fn build_repair_prompt(issue: &Issue, attempt: u32, test_output: &str) -> String {
+    format!(
+        "You are continuing work on issue #{number} ({title}) in the same git worktree \
+         (your working directory). Your implementation was verified with `cargo test` and it \
+         FAILED. This is repair attempt {attempt} of {max}.\n\n\
+         Failing `cargo test` output:\n```\n{test_output}\n```\n\n\
+         Fix these failures without expanding scope: change only what is needed to make the \
+         tests pass, do not refactor or clean up unrelated code, and do not rewrite or delete \
+         tests just to make them pass unless the test itself is wrong. The same rules as before \
+         apply: stay inside the worktree, no git commit/push/gh, edit files only with the \
+         write/edit tools (never via shell), and use shell only for cargo build/test and \
+         read-only inspection. Run `cargo test` before finishing, and end with a one-line \
+         summary of what you changed.",
+        number = issue.number,
+        title = issue.title,
+        max = MAX_REPAIR_ATTEMPTS,
+    )
+}
+
 fn cargo_test(dir: &Path) -> (bool, String) {
     match Command::new("cargo").arg("test").current_dir(dir).output() {
         Ok(out) => {
             let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
             text.push_str(&String::from_utf8_lossy(&out.stdout));
-            let lines: Vec<&str> = text.lines().collect();
-            let tail = lines[lines.len().saturating_sub(30)..].join("\n");
-            (out.status.success(), tail)
+            (out.status.success(), tail_chars(&text, MAX_TEST_OUTPUT_CHARS))
         }
         Err(e) => (false, format!("failed to spawn cargo: {e}")),
     }
@@ -715,6 +805,30 @@ fn cargo_test(dir: &Path) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_decision_stops_on_pass() {
+        assert_eq!(repair_decision(true, 0), RepairStep::Done);
+        assert_eq!(repair_decision(true, MAX_REPAIR_ATTEMPTS), RepairStep::Done);
+    }
+
+    #[test]
+    fn repair_decision_continues_on_fail_until_limit() {
+        assert_eq!(repair_decision(false, 0), RepairStep::Repair(1));
+        assert_eq!(
+            repair_decision(false, MAX_REPAIR_ATTEMPTS - 1),
+            RepairStep::Repair(MAX_REPAIR_ATTEMPTS)
+        );
+        assert_eq!(repair_decision(false, MAX_REPAIR_ATTEMPTS), RepairStep::GiveUp);
+    }
+
+    #[test]
+    fn tail_and_summary_helpers() {
+        assert_eq!(tail_chars("a\nb", 10), "a\nb");
+        assert!(tail_chars("aaaa\nbbbb\ncccc", 6).ends_with("cccc"));
+        assert_eq!(one_line_summary(Some("x\nfixed it\n\n")), "fixed it");
+        assert_eq!(one_line_summary(None), "(no final message)");
+    }
 
     #[test]
     fn shell_edit_attempt_detects_file_writes() {
