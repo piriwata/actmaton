@@ -153,12 +153,51 @@ fn setup_worktree(
         .parent()
         .ok_or("repo root has no parent directory")?
         .join(format!("actmaton-issue-{number}"));
-    if worktree.exists() {
-        return Err(format!(
-            "worktree path {} already exists; remove it (and branch {branch}) before re-running",
-            worktree.display()
-        )
-        .into());
+    let branch_exists = git(
+        repo_root,
+        &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+    )
+    .is_ok();
+    if worktree.exists() || branch_exists {
+        let dirty = if worktree.exists() {
+            !git(&worktree, &["status", "--porcelain"])?.is_empty()
+        } else {
+            false
+        };
+        let ahead: u64 = if branch_exists {
+            git(repo_root, &["rev-list", "--count", &format!("HEAD..{branch}")])?.parse()?
+        } else {
+            0
+        };
+        match leftover_decision(dirty, ahead) {
+            Leftover::Recreate => {
+                println!("removing clean leftover worktree/branch for issue {number}");
+                if worktree.exists() {
+                    git(
+                        repo_root,
+                        &[
+                            "worktree",
+                            "remove",
+                            worktree.to_str().ok_or("worktree path is not UTF-8")?,
+                        ],
+                    )?;
+                }
+                git(repo_root, &["worktree", "prune"])?;
+                if branch_exists {
+                    git(repo_root, &["branch", "-D", &branch])?;
+                }
+            }
+            Leftover::Refuse(reason) => {
+                return Err(format!(
+                    "leftover state from a previous attempt: worktree {} / branch {branch} {reason}. \
+                     Nothing was deleted. Review it, then commit/push the work or remove it manually \
+                     (`git worktree remove --force {}` and `git branch -D {branch}`) and re-run.",
+                    worktree.display(),
+                    worktree.display()
+                )
+                .into());
+            }
+        }
     }
     let out = Command::new("git")
         .args([
@@ -179,6 +218,25 @@ fn setup_worktree(
         .into());
     }
     Ok((branch, worktree))
+}
+
+#[derive(Debug, PartialEq)]
+enum Leftover {
+    Recreate,
+    Refuse(String),
+}
+
+/// Decide what to do with a leftover worktree/branch: only a clean one with
+/// no commits beyond the base may be discarded.
+fn leftover_decision(dirty: bool, ahead: u64) -> Leftover {
+    match (dirty, ahead) {
+        (false, 0) => Leftover::Recreate,
+        (true, 0) => Leftover::Refuse("has uncommitted changes".into()),
+        (false, n) => Leftover::Refuse(format!("has {n} commit(s) beyond the base")),
+        (true, n) => Leftover::Refuse(format!(
+            "has uncommitted changes and {n} commit(s) beyond the base"
+        )),
+    }
 }
 
 type RunLog = Arc<Mutex<Vec<String>>>;
@@ -431,6 +489,14 @@ fn cargo_test(dir: &Path) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leftover_decision_recreates_only_clean() {
+        assert_eq!(leftover_decision(false, 0), Leftover::Recreate);
+        assert!(matches!(leftover_decision(true, 0), Leftover::Refuse(_)));
+        assert!(matches!(leftover_decision(false, 2), Leftover::Refuse(_)));
+        assert!(matches!(leftover_decision(true, 2), Leftover::Refuse(_)));
+    }
 
     #[test]
     fn parses_issue_refs() {
