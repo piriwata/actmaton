@@ -20,10 +20,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.get(1).map(String::as_str) {
         Some("--version") => println!("{}", version_string()),
         Some("spike") => spike().await?,
-        Some("run") => match args.get(2) {
-            Some(issue_ref) => run_loop::run(issue_ref).await?,
+        Some("run") => match args[2..].iter().find(|a| !a.starts_with("--")) {
+            Some(issue_ref) => {
+                let dry_run = args[2..].iter().any(|a| a == "--dry-run");
+                run_loop::run(issue_ref, dry_run).await?
+            }
             None => {
-                eprintln!("usage: actmaton run <issue-number-or-url>");
+                eprintln!("usage: actmaton run <issue-number-or-url> [--dry-run]");
                 std::process::exit(2);
             }
         },
@@ -33,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("usage: actmaton --version          # print the actmaton version");
             println!("       actmaton spike              # run the Copilot SDK hello-world spike");
             println!("       actmaton run <issue|url>    # run the M0 loop for one GitHub issue");
+            println!("       actmaton run <issue|url> --dry-run  # print prompt and permission policy; no model call");
             println!("       actmaton propose            # draft the next task as an actmaton-proposal issue");
         }
     }
