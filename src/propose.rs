@@ -33,7 +33,22 @@ pub async fn propose() -> Result<(), Box<dyn std::error::Error>> {
     println!("propose log: {}", log_path.display());
 
     let reply = reply.ok_or("session returned no final message")?;
-    let (title, body) = extract_proposal(&reply)?;
+    let (title, mut body) = extract_proposal(&reply)?;
+    let unverified = check_references(&body, crate::USAGE, &|p| root.join(p).exists());
+    append_log(
+        &log_path,
+        &format!(
+            "\n== reference check ==\n{}\n",
+            if unverified.is_empty() {
+                "all references verified".to_string()
+            } else {
+                unverified.join("\n")
+            }
+        ),
+    );
+    if !unverified.is_empty() {
+        body.push_str(&unverified_note(&unverified));
+    }
     let url = create_issue(&title, &body)?;
 
     println!("\n================ propose summary ================");
@@ -80,13 +95,143 @@ fn gather_snapshot(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     )?;
     let files: Vec<&str> = files.lines().take(200).collect();
     let todos = scan_todos(&root.join("src"), root);
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap_or_default();
+    let headers = readme_headers(&readme);
+    let fns = pub_fns(&root.join("src"), root);
 
     Ok(format!(
         "## Open issues (JSON)\n{issues}\n\n## Open pull requests (JSON)\n{prs}\n\n\
-         ## Recent commits\n{log}\n\n## Tracked files\n{}\n\n## TODO/FIXME in src/\n{}",
+         ## Recent commits\n{log}\n\n## Tracked files\n{}\n\n## TODO/FIXME in src/\n{}\n\n\
+         ## Current CLI usage (what `actmaton` prints)\n{}\n\n\
+         ## README section headers\n{}\n\n## pub fn names per src/ file\n{}",
         files.join("\n"),
         if todos.is_empty() { "(none)".to_string() } else { todos.join("\n") },
+        crate::USAGE,
+        if headers.is_empty() { "(none)".to_string() } else { headers.join("\n") },
+        if fns.is_empty() { "(none)".to_string() } else { fns.join("\n") },
     ))
+}
+
+/// Markdown header lines (`# ...`) of a README, outside code fences.
+fn readme_headers(text: &str) -> Vec<String> {
+    let mut in_fence = false;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence && line.starts_with('#') {
+            out.push(line.trim().to_string());
+        }
+    }
+    out
+}
+
+/// `file: name, name` of `pub fn` names for each .rs file under `dir`.
+fn pub_fns(dir: &Path, root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
+        if p.is_dir() {
+            out.extend(pub_fns(&p, root));
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            let names = text
+                .lines()
+                .filter_map(|l| {
+                    let rest = l.trim_start().strip_prefix("pub ")?;
+                    let rest = rest.strip_prefix("async ").unwrap_or(rest);
+                    let rest = rest.strip_prefix("fn ")?;
+                    Some(rest.split(|c: char| !c.is_alphanumeric() && c != '_').next()?.to_string())
+                })
+                .collect::<Vec<_>>();
+            if !names.is_empty() {
+                let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();
+                out.push(format!("{rel}: {}", names.join(", ")));
+            }
+        }
+    }
+    out
+}
+
+fn is_word_present(line: &str, words: &[&str]) -> bool {
+    line.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| words.contains(&w))
+}
+
+/// Check backtick-quoted paths, flags and `actmaton ...` commands in `body`
+/// against the repo (`path_exists`) and the CLI `usage`. Returns one
+/// description per reference that does not exist and is not presented as new
+/// (a line containing add/new/create/introduce/implement).
+fn check_references(body: &str, usage: &str, path_exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let known_flags: Vec<&str> = usage.split_whitespace().filter(|w| w.starts_with("--")).collect();
+    let known_cmds: Vec<&str> = usage
+        .lines()
+        .filter_map(|l| {
+            let rest = l.split("actmaton ").nth(1)?;
+            let w = rest.split_whitespace().next()?;
+            Some(w).filter(|w| !w.starts_with('<'))
+        })
+        .collect();
+    let new_words = ["add", "adds", "new", "create", "introduce", "implement", "support"];
+    let mut out: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if is_word_present(line, &new_words) {
+            continue;
+        }
+        for (i, tok) in line.split('`').enumerate() {
+            if i % 2 == 0 || tok.trim().is_empty() {
+                continue;
+            }
+            let tok = tok.trim();
+            let mut problems = Vec::new();
+            let words: Vec<&str> = tok.split_whitespace().collect();
+            if words[0] == "actmaton" {
+                if let Some(c) = words.get(1).filter(|c| !c.starts_with('-') && !c.starts_with('<')) {
+                    if !known_cmds.contains(c) {
+                        problems.push(format!("command `actmaton {c}`"));
+                    }
+                }
+            }
+            for w in words.iter().filter(|w| w.starts_with("--")) {
+                let flag = w.split('=').next().unwrap_or(w);
+                if !known_flags.contains(&flag) {
+                    problems.push(format!("flag `{flag}`"));
+                }
+            }
+            if words.len() == 1 && tok.starts_with("src/") {
+                let path = tok.split(':').next().unwrap_or(tok);
+                if !path_exists(path) {
+                    problems.push(format!("path `{path}`"));
+                }
+            }
+            for p in problems {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn unverified_note(items: &[String]) -> String {
+    format!(
+        "\n\n---\n⚠ unverified references: the following are not present in the current \
+         repo/CLI and are not phrased as new additions: {}",
+        items.join(", ")
+    )
+}
+
+fn append_log(path: &Path, text: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+        let _ = f.write_all(text.as_bytes());
+    }
 }
 
 /// `file:line: text` for each TODO/FIXME under `dir`.
@@ -122,7 +267,10 @@ fn build_prompt(snapshot: &str) -> String {
          - Do not duplicate any open issue or open pull request.\n\
          - Prefer a small, verifiable improvement to actmaton itself.\n\
          - If the roadmap (M2 self-proposal -> M3 repeated loop -> M4 autonomy/local models) \
-         suggests a natural next step, prefer it.\n\n\
+         suggests a natural next step, prefer it.\n\
+         - Reference only files, commands, flags, and document sections that appear in the \
+         snapshot. Anything else must be phrased explicitly as a new addition (e.g. \"add a \
+         --help flag\"), never as an existing thing to modify.\n\n\
          Reply with ONLY a JSON object: {{\"title\": \"...\", \"body\": \"...\"}}. The body is \
          Markdown with the sections: Motivation, Scope, Acceptance criteria."
     )
@@ -237,6 +385,25 @@ fn decide(root: &Path, kind: Option<&PermissionRequestKind>, path: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_parts() {
+        let h = readme_headers("# A\ntext\n```\n# not\n```\n## B");
+        assert_eq!(h, vec!["# A", "## B"]);
+        assert!(crate::USAGE.contains("actmaton propose"));
+    }
+
+    #[test]
+    fn reference_check() {
+        let usage = crate::USAGE;
+        let exists = |p: &str| p == "src/main.rs";
+        let check = |b: &str| check_references(b, usage, &exists);
+        assert!(check("Edit `src/main.rs` and run `actmaton run --dry-run`.").is_empty());
+        assert_eq!(check("Edit `src/nope.rs`."), vec!["path `src/nope.rs`"]);
+        assert_eq!(check("`actmaton run --help` documents it"), vec!["flag `--help`"]);
+        assert!(check("Add a `--help` flag").is_empty());
+        assert_eq!(check("Run `actmaton foo`"), vec!["command `actmaton foo`"]);
+    }
 
     #[test]
     fn extracts_plain_json() {

@@ -31,17 +31,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Some("propose") => propose::propose().await?,
-        _ => {
-            println!("actmaton (M0 seed)");
-            println!("usage: actmaton --version          # print the actmaton version");
-            println!("       actmaton spike              # run the Copilot SDK hello-world spike");
-            println!("       actmaton run <issue|url>    # run the M0 loop for one GitHub issue");
-            println!("       actmaton run <issue|url> --dry-run  # print prompt and permission policy; no model call");
-            println!("       actmaton propose            # draft the next task as an actmaton-proposal issue");
-        }
+        _ => println!("{USAGE}"),
     }
     Ok(())
 }
+
+pub const USAGE: &str = "actmaton (M0 seed)
+usage: actmaton --version          # print the actmaton version
+       actmaton spike              # run the Copilot SDK hello-world spike
+       actmaton run <issue|url>    # run the M0 loop for one GitHub issue
+       actmaton run <issue|url> --dry-run  # print prompt and permission policy; no model call
+       actmaton propose            # draft the next task as an actmaton-proposal issue";
 
 fn version_string() -> String {
     format!("actmaton {}", env!("CARGO_PKG_VERSION"))
