@@ -11,6 +11,7 @@ use std::time::Duration;
 use github_copilot_sdk::handler::ApproveAllHandler;
 use github_copilot_sdk::{Client, ClientOptions, MessageOptions, SessionConfig};
 
+mod audit;
 mod model;
 mod propose;
 mod run_loop;

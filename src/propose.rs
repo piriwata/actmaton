@@ -16,6 +16,7 @@ use github_copilot_sdk::{
 };
 use serde_json::Value;
 
+use crate::audit;
 use crate::model::{resolved_model, with_fallback, Attempt, ModelConfig, Role};
 use crate::run_loop::{final_message_text, path_within, payload_target_path, repo_root};
 
@@ -27,7 +28,15 @@ pub async fn propose() -> Result<(), Box<dyn std::error::Error>> {
     let root = repo_root()?;
     println!("repo root: {}", root.display());
 
-    let snapshot = gather_snapshot(&root)?;
+    let ledger_path = root
+        .parent()
+        .ok_or("repo root has no parent directory")?
+        .join("actmaton-runs")
+        .join("propose-ledger.jsonl");
+    let mut rejected = audit::read_ledger(&ledger_path);
+    rejected.extend(closed_rejected_issues());
+
+    let snapshot = gather_snapshot(&root, &rejected)?;
     let prompt = build_prompt(&snapshot);
 
     let (reply, notes) = run_session(&root, &prompt).await?;
@@ -35,8 +44,29 @@ pub async fn propose() -> Result<(), Box<dyn std::error::Error>> {
     println!("propose log: {}", log_path.display());
 
     let reply = reply.ok_or("session returned no final message")?;
-    let (title, mut body) = extract_proposal(&reply)?;
+    let findings = extract_findings(&reply)?;
+    let files = repo_files(&root);
+    let disp = audit::vet(&findings, &files, &rejected);
+    append_log(
+        &log_path,
+        &format!("\n== audit ==\n{}", audit::render_dispositions(&findings, &disp)),
+    );
+    let new_rejections = audit::ledger_entries(&findings, &disp);
+    if !new_rejections.is_empty() {
+        audit::append_ledger(&ledger_path, &new_rejections)?;
+        append_log(
+            &log_path,
+            &format!("ledger: recorded {} dropped finding(s) in {}\n", new_rejections.len(), ledger_path.display()),
+        );
+    }
+    let idx = disp
+        .iter()
+        .position(|d| *d == audit::Disposition::Filed)
+        .ok_or("no finding survived vetting; nothing filed (see log)")?;
+    let title = findings[idx].title.clone();
+    let mut body = findings[idx].body.clone().unwrap_or_default();
     let unverified = check_references(&body, crate::USAGE, &|p| root.join(p).exists());
+
     append_log(
         &log_path,
         &format!(
@@ -73,7 +103,46 @@ fn command_output(cmd: &mut Command, what: &str) -> Result<String, Box<dyn std::
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
-fn gather_snapshot(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+/// Titles of closed issues that were closed as "not planned".
+fn closed_rejected_issues() -> Vec<(String, String)> {
+    let out = command_output(
+        Command::new("gh").args([
+            "issue", "list", "--repo", REPO, "--state", "closed", "--limit", "100", "--json",
+            "number,title,stateReason",
+        ]),
+        "gh issue list (closed)",
+    )
+    .unwrap_or_default();
+    let v: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|i| i.get("stateReason").and_then(Value::as_str) == Some("NOT_PLANNED"))
+                .filter_map(|i| {
+                    let t = i.get("title")?.as_str()?.to_string();
+                    Some((t, format!("closed as not planned: #{}", i.get("number")?)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `(path, contents)` of tracked text files, for evidence and premise checks.
+fn repo_files(root: &Path) -> Vec<(String, String)> {
+    let list = command_output(
+        Command::new("git").arg("-C").arg(root).arg("ls-files"),
+        "git ls-files",
+    )
+    .unwrap_or_default();
+    list.lines()
+        .filter_map(|p| Some((p.to_string(), std::fs::read_to_string(root.join(p)).ok()?)))
+        .collect()
+}
+
+fn gather_snapshot(
+    root: &Path,
+    rejected: &[(String, String)],
+) -> Result<String, Box<dyn std::error::Error>> {
     let issues = command_output(
         Command::new("gh").args([
             "issue", "list", "--repo", REPO, "--state", "open", "--json",
@@ -105,12 +174,18 @@ fn gather_snapshot(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
         "## Open issues (JSON)\n{issues}\n\n## Open pull requests (JSON)\n{prs}\n\n\
          ## Recent commits\n{log}\n\n## Tracked files\n{}\n\n## TODO/FIXME in src/\n{}\n\n\
          ## Current CLI usage (what `actmaton` prints)\n{}\n\n\
-         ## README section headers\n{}\n\n## pub fn names per src/ file\n{}",
+         ## README section headers\n{}\n\n## pub fn names per src/ file\n{}\n\n\
+         ## Rejected findings (ledger + closed-as-not-planned issues; NEVER re-propose)\n{}",
         files.join("\n"),
         if todos.is_empty() { "(none)".to_string() } else { todos.join("\n") },
         crate::USAGE,
         if headers.is_empty() { "(none)".to_string() } else { headers.join("\n") },
         if fns.is_empty() { "(none)".to_string() } else { fns.join("\n") },
+        if rejected.is_empty() {
+            "(none)".to_string()
+        } else {
+            rejected.iter().map(|(t, r)| format!("- {t} ({r})")).collect::<Vec<_>>().join("\n")
+        },
     ))
 }
 
@@ -292,26 +367,43 @@ mod todo_tests {
 
 fn build_prompt(snapshot: &str) -> String {
     format!(
-        "You are proposing the next task for the actmaton repository ({REPO}). You have \
-         read-only access to the repository (working directory = the clone); you cannot \
-         write files or run shell commands, and everything you need is in the snapshot below.\n\n\
+        "You are auditing the actmaton repository ({REPO}) as an advisor that never writes \
+         code. You have read-only access to the repository (working directory = the clone); \
+         you cannot write files or run shell commands. Use the snapshot below and targeted \
+         file reads.\n\n\
          {snapshot}\n\n\
-         Propose exactly ONE concrete next task.\n\
-         - Do not duplicate any open issue or open pull request.\n\
-         - Prefer a small, verifiable improvement to actmaton itself.\n\
-         - If the roadmap (M2 self-proposal -> M3 repeated loop -> M4 autonomy/local models) \
-         suggests a natural next step, prefer it.\n\
-         - Reference only files, commands, flags, and document sections that appear in the \
-         snapshot. Anything else must be phrased explicitly as a new addition (e.g. \"add a \
-         --help flag\"), never as an existing thing to modify.\n\n\
-         Reply with ONLY a JSON object: {{\"title\": \"...\", \"body\": \"...\"}}. The body is \
-         Markdown with the sections: Motivation, Scope, Acceptance criteria."
+         Audit these categories: correctness, performance, test-coverage, tech-debt \
+         (duplication, dead code, premature abstraction, simplification), docs-drift, and \
+         direction (new features). Health/simplification findings are the default output; \
+         actmaton must not bloat. Direction is a separate slate: include at most ONE direction \
+         finding, and only with repo-internal evidence (a TODO/FIXME, a roadmap line, a \
+         repeated workaround) that you cite. Generic feature ideas will be dropped.\n\n\
+         Rules:\n\
+         - Every finding cites file:line evidence (e.g. \"src/run_loop.rs:120\" or \
+         \"src/run_loop.rs:120-130\") you have actually read, plus a short verbatim `quote` \
+         from those lines.\n\
+         - Vet yourself: re-read the cited lines before reporting. Claims about current state \
+         (\"X does not exist\", \"there are no tests for Y\") must be verified against the code. \
+         Phrase genuinely new things as additions (\"add ...\").\n\
+         - Do not duplicate open issues/PRs, and never re-propose anything under \"Rejected \
+         findings\".\n\
+         - Reference only files, commands, flags and sections that exist in the snapshot.\n\
+         - Give 3-8 findings, ordered by priority. Only the top 1-2 need a `body`.\n\n\
+         The `body` (Markdown) follows this plan shape, with these sections: Current state \
+         (evidence with file:line), In scope, Out of scope, Verification (exact commands, \
+         e.g. `cargo test`), Done criteria (machine-checkable), STOP conditions (\"if X, stop \
+         and report\").\n\n\
+         Reply with ONLY a JSON object: {{\"findings\": [{{\"title\": \"...\", \"category\": \
+         \"correctness|performance|test-coverage|tech-debt|docs-drift|direction\", \"claim\": \
+         \"one sentence\", \"evidence\": [\"path:line\"], \"quote\": \"verbatim text from the \
+         cited lines\", \"internal_evidence\": \"direction only: the TODO/roadmap/workaround \
+         cited\", \"body\": \"optional plan-shaped issue body\"}}]}}."
     )
 }
 
-/// Parse `{"title", "body"}` from a reply, tolerating a surrounding code fence
-/// or stray prose around the object.
-fn extract_proposal(reply: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+/// Parse `{"findings": [...]}` from a reply, tolerating a surrounding code
+/// fence or stray prose around the object.
+fn extract_findings(reply: &str) -> Result<Vec<audit::Finding>, Box<dyn std::error::Error>> {
     let text = reply.trim();
     let start = text.find('{').ok_or("no JSON object in reply")?;
     let end = text.rfind('}').ok_or("no JSON object in reply")?;
@@ -319,16 +411,13 @@ fn extract_proposal(reply: &str) -> Result<(String, String), Box<dyn std::error:
         return Err("no JSON object in reply".into());
     }
     let v: Value = serde_json::from_str(&text[start..=end])?;
-    let field = |k: &str| {
-        v.get(k)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| format!("proposal JSON is missing a non-empty `{k}`"))
-    };
-    Ok((field("title")?, field("body")?))
+    let findings = audit::parse_findings(&v);
+    if findings.is_empty() {
+        return Err("reply JSON has no `findings`".into());
+    }
+    Ok(findings)
 }
+
 
 fn create_issue(title: &str, body: &str) -> Result<String, Box<dyn std::error::Error>> {
     command_output(
@@ -482,22 +571,21 @@ mod tests {
 
     #[test]
     fn extracts_plain_json() {
-        let (t, b) = extract_proposal(r#"{"title": "T", "body": "B"}"#).unwrap();
-        assert_eq!((t.as_str(), b.as_str()), ("T", "B"));
+        let f = extract_findings(r#"{"findings": [{"title": "T", "category": "tech-debt", "body": "B"}]}"#).unwrap();
+        assert_eq!((f[0].title.as_str(), f[0].body.as_deref()), ("T", Some("B")));
     }
 
     #[test]
     fn extracts_fenced_json() {
-        let reply = "Here:\n```json\n{\"title\": \"T\", \"body\": \"## Motivation\\nx\"}\n```\n";
-        let (t, b) = extract_proposal(reply).unwrap();
-        assert_eq!(t, "T");
-        assert!(b.starts_with("## Motivation"));
+        let reply = "Here:\n```json\n{\"findings\": [{\"title\": \"T\", \"category\": \"direction\"}]}\n```\n";
+        let f = extract_findings(reply).unwrap();
+        assert_eq!(f[0].category, "direction");
     }
 
     #[test]
     fn rejects_bad_replies() {
-        assert!(extract_proposal("no json").is_err());
-        assert!(extract_proposal(r#"{"title": "", "body": "B"}"#).is_err());
+        assert!(extract_findings("no json").is_err());
+        assert!(extract_findings(r#"{"findings": []}"#).is_err());
     }
 
     #[test]
