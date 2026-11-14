@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>actmaton ユーザーガイド</title>
+<style>
+  :root{
+    --ink:#1f2328; --muted:#59636e; --line:#d1d9e0; --bg:#ffffff; --soft:#f6f8fa;
+    --accent:#0969da; --accent-soft:#ddf4ff; --warn-bg:#fff8c5; --warn-line:#d4a72c;
+    --code-bg:#eff1f3; --radius:8px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; color:var(--ink); background:var(--bg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Kaku Gothic ProN","Hiragino Sans","Noto Sans JP",Meiryo,sans-serif;
+    line-height:1.75; font-size:16px;
+  }
+  .layout{display:flex; max-width:1180px; margin:0 auto; align-items:flex-start}
+  nav.side{
+    position:sticky; top:0; width:240px; flex:0 0 240px; height:100vh; overflow:auto;
+    padding:24px 16px 24px 24px; border-right:1px solid var(--line); font-size:14px;
+  }
+  nav.side .brand{font-weight:700; font-size:18px; margin-bottom:4px}
+  nav.side .brand-sub{color:var(--muted); font-size:12px; margin-bottom:20px}
+  nav.side a{display:block; color:var(--ink); text-decoration:none; padding:5px 8px; border-radius:6px}
+  nav.side a:hover{background:var(--soft); color:var(--accent)}
+  nav.side .nav-h{margin:16px 8px 4px; font-size:12px; color:var(--muted); letter-spacing:.04em}
+  main{flex:1 1 auto; min-width:0; max-width:880px; padding:32px 40px 64px}
+  h1{font-size:32px; line-height:1.3; margin:0 0 8px}
+  h2{font-size:24px; margin:56px 0 12px; padding-bottom:8px; border-bottom:1px solid var(--line)}
+  h3{font-size:18px; margin:28px 0 8px}
+  p{margin:10px 0}
+  ul,ol{margin:8px 0 8px 0; padding-left:1.4em}
+  li{margin:4px 0}
+  code{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.88em;
+    background:var(--code-bg); padding:.12em .35em; border-radius:6px;
+  }
+  pre{
+    background:var(--soft); border:1px solid var(--line); border-radius:var(--radius);
+    padding:14px 16px; overflow-x:auto; font-size:14px; line-height:1.6;
+  }
+  pre code{background:none; padding:0; font-size:14px}
+  table{border-collapse:collapse; width:100%; margin:14px 0; font-size:15px}
+  th,td{border:1px solid var(--line); padding:8px 12px; text-align:left; vertical-align:top}
+  th{background:var(--soft)}
+  .tagline{font-size:19px; color:var(--muted); margin:0 0 20px}
+  .hero{
+    background:linear-gradient(180deg,#f0f7ff, #ffffff); border:1px solid var(--line);
+    border-radius:12px; padding:28px 28px 20px; margin-bottom:8px;
+  }
+  .hero .en{font-weight:700; color:var(--accent); letter-spacing:.01em}
+  .badge{
+    display:inline-block; font-size:12px; font-weight:600; line-height:1;
+    padding:4px 8px; border-radius:999px; vertical-align:middle; margin-left:8px; white-space:nowrap;
+  }
+  .badge.pending{background:var(--warn-bg); border:1px solid var(--warn-line); color:#7d5e00}
+  .badge.done{background:#dafbe1; border:1px solid #1a7f37; color:#116329}
+  .note{
+    background:var(--soft); border-left:4px solid var(--accent);
+    padding:10px 16px; margin:14px 0; border-radius:0 var(--radius) var(--radius) 0; font-size:15px;
+  }
+  .warn{
+    background:#fffdf0; border-left:4px solid var(--warn-line);
+    padding:10px 16px; margin:14px 0; border-radius:0 var(--radius) var(--radius) 0; font-size:15px;
+  }
+  .flow{display:flex; flex-wrap:wrap; align-items:stretch; gap:0; margin:18px 0}
+  .flow .box{
+    flex:1 1 150px; background:var(--soft); border:1px solid var(--line); border-radius:var(--radius);
+    padding:12px 14px; font-size:14px;
+  }
+  .flow .box b{display:block; font-size:15px; margin-bottom:4px}
+  .flow .arrow{
+    flex:0 0 28px; display:flex; align-items:center; justify-content:center;
+    color:var(--muted); font-size:18px;
+  }
+  dl.glossary dt{font-weight:700; margin-top:18px}
+  dl.glossary dd{margin:2px 0 0 0; color:#333}
+  footer{
+    margin-top:72px; padding-top:20px; border-top:1px solid var(--line);
+    color:var(--muted); font-size:14px;
+  }
+  a{color:var(--accent)}
+  @media (max-width:820px){
+    .layout{flex-direction:column}
+    nav.side{
+      position:static; width:100%; flex:none; height:auto; border-right:none;
+      border-bottom:1px solid var(--line); padding:16px 20px;
+    }
+    nav.side a{display:inline-block; margin-right:4px}
+    main{padding:24px 20px 48px}
+    .flow{flex-direction:column}
+    .flow .arrow{transform:rotate(90deg); flex:0 0 24px; align-self:center}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="side">
+  <div class="brand">actmaton</div>
+  <div class="brand-sub">ユーザーガイド</div>
+  <a href="#about">actmaton とは</a>
+  <a href="#map">概念の地図</a>
+  <a href="#commands">コマンドリファレンス</a>
+  <div class="nav-h">しくみ</div>
+  <a href="#loop">自律ループ</a>
+  <a href="#steering">Steering の方法</a>
+  <a href="#audit">propose の監査</a>
+  <a href="#safety">安全装置</a>
+  <a href="#models">モデル</a>
+  <a href="#logs">ログとレポート</a>
+  <div class="nav-h">その他</div>
+  <a href="#glossary">用語集</a>
+  <a href="#about-doc">このドキュメントについて</a>
+</nav>
+
+<main>
+
+<section id="about" class="hero">
+  <h1>actmaton</h1>
+  <p class="tagline"><span class="en">Build while you sleep. Steer when you wake.</span><br>
+  寝ている間に作り、起きたときに舵を取る。</p>
+  <p>
+    actmaton は、ローカルファーストな<strong>自律コーディングエージェント</strong>です。
+    Rust / Tokio 製のコントロールループが GitHub Copilot SDK を通じてモデルを動かし、
+    GitHub Issue に書かれたタスクを、隔離された git worktree の中で実装し、テストし、
+    ドラフト PR として提出します。
+  </p>
+  <p>
+    人の役割は、個々の操作を承認することではありません。
+    <strong>方向を決める（steering）</strong>ことと、<strong>PR をマージするかどうか判断する</strong>ことだけです。
+    それ以外の「課題を見つける → 実装する → テストする → PR を出す」は actmaton が自律的に回します。
+  </p>
+  <p>
+    actmaton の目標は「良い自律コーディングエージェントになること」。
+    その最初の実証として、actmaton は自分自身のリポジトリを開発し続けています（dogfooding）。
+    初期の実行ターゲットは 16 GB の Apple Silicon Mac です。
+  </p>
+</section>
+
+<h2 id="map">概念の地図</h2>
+<p>登場人物は4つだけです。それぞれの担当を押さえれば、全体が読めます。</p>
+
+<div class="flow">
+  <div class="box"><b>あなた（人）</b>方向を決める。Issue コメントで舵を取り、PR のマージを判断する。</div>
+  <div class="arrow">→</div>
+  <div class="box"><b>propose（監査役）</b>リポジトリを監査し、次のタスクを Issue として起票する。コードは書かない。</div>
+  <div class="arrow">→</div>
+  <div class="box"><b>run（実装役）</b>Issue を1件受け取り、worktree の中で実装とテストを行う。</div>
+  <div class="arrow">→</div>
+  <div class="box"><b>loop（自律反復）</b>propose と run を繰り返し回し続ける司令塔。止まる条件は機械的に決まっている。</div>
+</div>
+
+<ul>
+  <li><strong>PR はドラフトで作られます。</strong> マージできるのは人だけです。actmaton が勝手にマージすることはありません。</li>
+  <li><strong>バックログと判断の記録は GitHub にあります。</strong> Issue がタスク、コメントが指示、PR が成果物、という役割分担です。</li>
+  <li><strong>安全は「承認」ではなく「ガードレール」で確保します。</strong> 書き込み範囲の制限、シェルの検査、停止条件などが自動で働きます（<a href="#safety">安全装置</a>）。</li>
+</ul>
+
+<h2 id="commands">コマンドリファレンス</h2>
+<p>actmaton のコマンドは4つです（ほかに開発用 <code>spike</code> があります）。</p>
+
+<table>
+  <tr><th style="width:38%">コマンド</th><th>何をするか</th></tr>
+  <tr>
+    <td><code>actmaton run &lt;issue&gt; [--dry-run]</code></td>
+    <td>GitHub Issue を1件実装します。Issue の本文（とコメント）を読み、専用の worktree とブランチを作り、モデルに実装させ、最後に actmaton 自身が <code>cargo test</code> を実行して合否を判定します。ブランチの push や PR の作成はしません（それは loop の仕事です）。</td>
+  </tr>
+  <tr>
+    <td><code>actmaton run &lt;issue&gt; --dry-run</code></td>
+    <td>モデルを呼ばずに、セッションへ渡すプロンプトと権限ポリシーの要約を表示します。「何をさせようとしているか」を事前に確認するためのモードです。</td>
+  </tr>
+  <tr>
+    <td><code>actmaton propose</code></td>
+    <td>リポジトリを監査し、次のタスクを1件、GitHub Issue として起票します（ラベル <code>actmaton-proposal</code>）。コードは変更しません。監査の仕組みは<a href="#audit">propose の監査</a>を参照してください。</td>
+  </tr>
+  <tr>
+    <td><code>actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N]</code><span class="badge pending">PR #35 マージ待ち</span></td>
+    <td>propose と run を自律的に繰り返します。テストが通った変更は push され、ドラフト PR が自動で開かれます。詳細は<a href="#loop">自律ループの仕組み</a>を参照してください。</td>
+  </tr>
+  <tr>
+    <td><code>actmaton --version</code></td>
+    <td>バージョンを表示します（例：<code>actmaton 0.1.0</code>）。</td>
+  </tr>
+</table>
+
+<div class="note">
+  <code>run</code> の引数は Issue 番号（<code>17</code> や <code>#17</code>）でも、Issue の URL でも構いません。
+</div>
+
+<h2 id="loop">自律ループの仕組み<span class="badge pending">PR #35 マージ待ち</span></h2>
+<p>
+  <code>actmaton loop</code> は、人が1件ずつ指示しなくても開発が進み続けるためのコマンドです。
+  各イテレーション（繰り返しの1回）で次のように動きます。
+</p>
+
+<h3>タスクの選び方</h3>
+<ol>
+  <li>open している Issue のうち、<strong>最も古いもの</strong>を選ぶ。</li>
+  <li>ただし <code>hold</code> ラベルが付いた Issue と、この loop の実行中にすでに処理した Issue は除く。</li>
+  <li>選べる Issue が無ければ、<code>propose</code> が新しい Issue を起票し、それを次のイテレーションで処理する。</li>
+</ol>
+
+<h3>停止条件</h3>
+<p>暴走を防ぐため、止まる条件は最初に機械的に決まっています。開始時にすべてログへ出力されます。</p>
+<table>
+  <tr><th style="width:38%">条件</th><th>意味（既定値）</th></tr>
+  <tr><td><code>--max-iterations N</code></td><td>イテレーション回数の上限（既定 5）</td></tr>
+  <tr><td><code>--max-failures N</code></td><td>連続失敗の上限（既定 2）。失敗した Issue を同じ実行で再試行することはない</td></tr>
+  <tr><td><code>--budget-minutes N</code></td><td>実行時間の予算（既定 240 分）</td></tr>
+</table>
+
+<h3>レポート</h3>
+<p>
+  イテレーションごとに、使ったモデル、合否、PR のリンク、1行要約が
+  <code>actmaton-runs/loop-*.md</code> に追記され、標準出力にも表示されます。
+  進捗はこのレポートとドラフト PR を見れば追えます。
+</p>
+<div class="note">
+  ループが作る PR は<strong>ドラフト</strong>です。マージは常に行いません。マージは人の判断です。
+</div>
+
+<h2 id="steering">Steering の方法</h2>
+<p>
+  steering（舵取り）は、actmaton の作業に人が介入するための正規の経路です。
+  主な手段は GitHub Issue のコメントです。
+</p>
+
+<h3>Issue コメントで指示する<span class="badge done">PR #22 実装済み</span></h3>
+<ul>
+  <li><code>run</code> は Issue の本文だけでなく<strong>コメントも読み</strong>、セッションに渡します（時系列順、直近20件まで）。</li>
+  <li><strong>本文とコメントが矛盾する場合は、コメントが優先</strong>されます。本文を書き直さなくても、コメントで上書き指示ができます。</li>
+  <li>loop の実行中にコメントを書けば、次のイテレーションから反映されます。</li>
+</ul>
+<p>
+  なぜこの仕組みが要るのか：以前は run が本文しか読まなかったため、コメントに書いた誘導がセッションに届かず、同じ Issue で3回やり直しになったことがあります（Issue #14 の実装時）。PR #22 でこの穴を塞ぎました。
+</p>
+
+<h3>hold ラベルで止める</h3>
+<p>
+  「この Issue にはまだ触るな」という場合は <code>hold</code> ラベルを付けてください。
+  loop は hold 付きの Issue を選択しません。付け外しは即座に効きます。
+</p>
+
+<h3>やり直し・方向修正の頼み方</h3>
+<ul>
+  <li><strong>部分的な修正</strong>：対象の Issue にコメントで具体的に書く（「〜ではなく〜してほしい」）。次に run / loop がその Issue を扱うときに反映されます。</li>
+  <li><strong>丸ごとやり直し</strong>：PR を閉じ、Issue に何が違ったかをコメントしてから再実行させます。前回の作業が worktree に残っている場合、leftover ガードが勝手に消さずに停止するので、人の確認なしに作業が消えることはありません（<a href="#safety">安全装置</a>）。</li>
+  <li><strong>大きな方向転換</strong>：新しい Issue を立てるか、既存 Issue のコメントで方針を示します。actmaton は Issue の内容を正として動きます。</li>
+</ul>
+
+<div class="note">
+  繰り返しになりますが、<strong>マージだけは常に行います（人）</strong>。
+  actmaton の権限の範囲は「ドラフト PR を出すところまで」です。
+</div>
+
+<h2 id="audit">propose の監査<span class="badge pending">PR #33 マージ待ち</span></h2>
+<p>
+  <code>propose</code> は「次の機能を思いつく」仕組みではありません。コードベースを<strong>監査</strong>し、
+  証拠のある課題だけを Issue 化する仕組みです。設計の参考は
+  <a href="https://github.com/shadcn/improve">shadcn/improve</a> の「監査役はコードを書かず、計画だけを作る」という考え方です。
+  狙いは、コーディング AI にありがちな「機能とコードが増える一方で肥大化する」流れを抑えることです。
+</p>
+
+<h3>監査カテゴリ</h3>
+<table>
+  <tr><th style="width:30%">カテゴリ</th><th>見るもの</th></tr>
+  <tr><td>正確性</td><td>バグ、仕様と実装の食い違い</td></tr>
+  <tr><td>性能</td><td>無駄な処理、不要なコスト</td></tr>
+  <tr><td>テスト</td><td>テストの無いモジュール、検証の穴</td></tr>
+  <tr><td>技術的負債と簡素化</td><td>重複、デッドコード、早すぎる抽象化、削除できるコード</td></tr>
+  <tr><td>ドキュメント</td><td>ドキュメントとコードの不整合（ドキュメントずれ）</td></tr>
+  <tr><td>方向性</td><td>新機能の提案。<strong>別枠</strong>で扱い、扱うのは以下で制限される</td></tr>
+</table>
+<p>
+  方向性（新機能）の提案は、健全性タスクとは別枠です。1回の propose で起票できるのは最大1件で、
+  しかもリポジトリ内の証拠（TODO、ロードマップ、繰り返し現れる回避策など）を引用できた場合に限ります。
+  一般論的なアイデアは vet で落とされます。
+</p>
+
+<h3>vet（精査）と前提チェック</h3>
+<ul>
+  <li><strong>証拠の引用の再読</strong>：発見が引用する <code>file:line</code> を実際に読み直し、引用文がその場所にあるか確認します。合わなければ落とします。</li>
+  <li><strong>前提チェック</strong>：「X が無い」「Y のテストが無い」のような<em>現状についての主張</em>は、ファイルを実際に確認して裏取りします。思い込みの前提で Issue が立つことを防ぎます（過去に「テストが無い」という誤った前提の提案が出たことがあります）。</li>
+  <li>落とした発見は捨てずに<strong>却下台帳</strong>へ記録します。</li>
+</ul>
+
+<h3>却下台帳</h3>
+<p>
+  <code>actmaton-runs/propose-ledger.jsonl</code> は、vet で落とした発見とその理由の記録です。
+  次回の propose はこれを読み込み、同じ発見を再提案しません。
+  「一度検討して却下したものが何度も浮上する」という無駄を断つための仕組みです。
+</p>
+
+<h3>起票される Issue の形式</h3>
+<p>propose が作る Issue は、実装役が迷わないよう計画形式で書かれます。</p>
+<ul>
+  <li><strong>現在の状態</strong>（証拠つき）</li>
+  <li><strong>対象範囲（In scope）</strong>と<strong>対象外（Out of scope）</strong></li>
+  <li><strong>検証コマンド</strong>（正確な実行方法）</li>
+  <li><strong>完了条件</strong>（機械的に判定できる形で）</li>
+  <li><strong>STOP 条件</strong>（「X の場合は止まって報告すること」）</li>
+</ul>
+
+<h2 id="safety">安全装置</h2>
+<p>
+  actmaton は無人で動く時間が長いため、安全は人の承認ではなく自動のガードレールで確保します。
+</p>
+
+<table>
+  <tr><th style="width:30%">装置</th><th>内容</th></tr>
+  <tr>
+    <td>worktree スコープの権限</td>
+    <td>セッションが読み書きできるのは、そのタスク専用 worktree の中だけです。パスを正規化した上で判定し、worktree の外へのアクセスは拒否されます。シェルコマンドも、worktree の外を指すものは拒否されます。<code>git push</code> はセッションからは実行できません。</td>
+  </tr>
+  <tr>
+    <td>シェルガード<span class="badge done">PR #19 実装済み</span></td>
+    <td>シェル経由のファイル編集（ヒアドキュメント、ファイルへのリダイレクト、<code>sed -i</code>、<code>tee</code>、<code>dd of=</code> など）を決定的に検出して拒否します。拒否するときは理由をモデルへフィードバックとして返すので、セッションは「黙って諦める」のではなく write ツールに切り替えて続行できます。<code>/dev/null</code> への出力や <code>2&gt;&amp;1</code> のような読み取り専用の形は通します。</td>
+  </tr>
+  <tr>
+    <td>leftover ガード<span class="badge done">PR #10 実装済み</span></td>
+    <td>同じ Issue を再実行したとき、前回の worktree やブランチが残っていた場合の処理です。綺麗で先行コミットが無ければ作り直しますが、<strong>変更が残っている・コミットが進んでいる場合は、実行を拒否して何も消しません</strong>。人の作業や前回の成果が自動で消える事故を防ぎます。</td>
+  </tr>
+  <tr>
+    <td>自己修復<span class="badge pending">PR #31 マージ待ち</span></td>
+    <td>実装後に <code>cargo test</code> が落ちたら、失敗出力を次のセッションに渡して直させる、というフィードバックループです。再試行は最大2回まで。直らなければ worktree を残したまま失敗として終了します。</td>
+  </tr>
+  <tr>
+    <td>プロンプト側の編集ルール<span class="badge done">PR #18 実装済み</span></td>
+    <td>セッションへの指示でも、ファイル編集は write ツールで小さく行うこと、シェル編集をしないこと、拒否されたら黙って終わらず手段を切り替えること、を明示しています。ポリシー（拒否側）とプロンプト（指示側）で同じルールを両面からかけています。</td>
+  </tr>
+</table>
+
+<h3>サンドボックスについて（正直な現状）</h3>
+<p>
+  本来の本命は、OS レベルのサンドボックスでセッションの手足を囲うことです。
+  GitHub Copilot SDK にはそのための設定（<code>SandboxConfig</code>：Seatbelt / Bubblewrap 等で囲い、
+  認証情報の隠蔽やネットワーク遮断まで担う設計）があることが分かっています。
+  しかし Rust SDK がその型を公開していない不具合のため、まだ使えません。
+  上流に <a href="https://github.com/github/copilot-sdk/issues/2922">github/copilot-sdk#2922</a> として報告済みで、修正の監視を続けています。
+</p>
+<div class="warn">
+  つまり現状のシェル権限は「文字列ベースの判定＋ガード」という<strong>暫定</strong>の仕組みであり、OS サンドボックスの代替ではありません。
+  だからこそ今は、worktree スコープ、ドラフト PR、マージは人、という多層の決まりとセットで運用しています。
+  上流の修正が出れば、サンドボックス方式へ移行する計画です。
+</div>
+
+<h2 id="models">モデル</h2>
+<p>
+  actmaton のセッションは、役割ごとに違うモデル設定を使えます。
+  「自己評価は甘くなりがち」という問題への対策として、<strong>実装する側と評価する側を分ける</strong>のが基本方針です。
+</p>
+
+<h3>役割ごとの既定値</h3>
+<table>
+  <tr><th style="width:26%">役割</th><th style="width:30%">既定のモデル</th><th>理由</th></tr>
+  <tr>
+    <td>実装（run、自己修復を含む）</td>
+    <td><strong>Fusion、ティア Standard</strong></td>
+    <td>Fusion はタスクに応じてモデルを自動で振り分ける仕組みで、コスト面の割引もあるとされています。タスクごとに実際に選ばれたモデルはイベントとログで確認できます。</td>
+  </tr>
+  <tr>
+    <td>提案（propose）と評価（vet）</td>
+    <td><strong>gemini-4-hydrogen</strong></td>
+    <td>実装側とはモデルのファミリーを変え、評価の独立性を保ちます。</td>
+  </tr>
+</table>
+
+<h3>設定の優先順位<span class="badge pending">フラグ化は Issue #36</span></h3>
+<ol>
+  <li><strong>CLI フラグ</strong>（<code>--model</code> / <code>--fusion-tier</code>）— 導入予定（Issue #36）。</li>
+  <li><strong>環境変数</strong>（<code>ACTMATON_MODEL</code>、<code>ACTMATON_FUSION_TIER</code>、役割別の上書き）— 現行の仕組み。<span class="badge pending">PR #30 マージ待ち</span></li>
+  <li><strong>組み込みの既定値</strong>（上の表）。</li>
+</ol>
+<p>ログには、どの経路で決まった設定かも併せて記録されます。</p>
+
+<h3>フォールバック</h3>
+<p>
+  指定したモデルがプランの都合などで使えない場合、actmaton は<strong>エラーで死なず</strong>、
+  既定の自動選択（auto）に切り替えて実行を完走し、その旨をログに明記します。
+  実際に使われたモデル（resolved model）はセッションのイベントから取得してログに残すので、
+  「auto の中身がサーバー側の都合で変わった」ような変化も後から追えます。
+</p>
+
+<div class="warn">
+  正直な注意点：上位の Fusion ティアである <strong>High（HydraFusion）</strong>は、
+  現在のアカウントのプラン（Copilot Pro）でも権限が無効で使えませんでした。
+  またカタログに載っていないモデル名（例：<code>claude-opus-*</code>）は実行時に「not available」になります。
+  既定値が Standard と gemini-4-hydrogen なのは、実際に動作確認が取れた範囲で選んでいるためです。
+  プランが変われば使える範囲も変わる可能性があるので、その場合は再調査が必要です。
+</div>
+
+<h2 id="logs">ログとレポート</h2>
+<p>
+  実行の記録は、リポジトリの隣の <code>actmaton-runs/</code> ディレクトリに残ります。
+  「actmaton が何をしたか」は、まずここを見れば分かります。
+</p>
+<table>
+  <tr><th style="width:34%">ファイル</th><th>中身</th></tr>
+  <tr>
+    <td><code>issue-&lt;n&gt;-&lt;時刻&gt;.log</code>（run ログ）</td>
+    <td>1回の run の記録。セッションの手順、権限判定の結果（許可／拒否とその理由）、最終メッセージ、差分の統計、テストの合否、自己修復の試行、使われたモデルとフォールバックの有無が入ります。</td>
+  </tr>
+  <tr>
+    <td><code>propose-&lt;時刻&gt;.log</code>（propose ログ）</td>
+    <td>監査のプロンプトとモデルの応答、参照チェック・前提チェックの結果、発見ごとの処分（起票／見送り／却下）が入ります。</td>
+  </tr>
+  <tr>
+    <td><code>loop-&lt;時刻&gt;.md</code>（loop レポート）<span class="badge pending">PR #35 マージ待ち</span></td>
+    <td>loop のイテレーションごとの記録。Issue、モデル、合否、PR リンク、1行要約と、最後に止まった理由が入ります。</td>
+  </tr>
+  <tr>
+    <td><code>propose-ledger.jsonl</code>（却下台帳）<span class="badge pending">PR #33 マージ待ち</span></td>
+    <td>vet で落とした発見とその理由の台帳。次回の propose が読み込み、再提案を防ぎます。</td>
+  </tr>
+</table>
+
+<h2 id="glossary">用語集</h2>
+<dl class="glossary">
+  <dt>steering（舵取り）</dt>
+  <dd>人が actmaton の方向を決める行為全般。Issue コメントでの指示、hold ラベルの付け外し、PR のマージ判断が含まれます。個々の操作の承認とは別の概念です。</dd>
+
+  <dt>vet（精査）</dt>
+  <dd>propose の発見を起票前に検証する工程。引用されたコードを読み直し、前提を裏取りし、通らない発見を落とします。「懐疑的に当たる」のが仕事なので、発見を出した側とは別の工程として分けています。</dd>
+
+  <dt>却下台帳（rejection ledger）</dt>
+  <dd>vet で落とした発見と理由を記録したファイル（<code>propose-ledger.jsonl</code>）。次回以降の propose が参照し、同じ提案の蒸し返しを防ぎます。</dd>
+
+  <dt>leftover ガード</dt>
+  <dd>再実行時に前回の worktree／ブランチが残っている場合の保護処理。作業が残っていたら消さずに停止します（PR #10）。</dd>
+
+  <dt>hold（ホールド）</dt>
+  <dd>GitHub ラベルの名前。このラベルが付いた Issue は loop の選択対象から外れます。人のための手動ブレーキです。</dd>
+
+  <dt>dry-run（ドライラン）</dt>
+  <dd>モデルを呼ばずに、プロンプトと権限ポリシーの要約だけを表示する確認モード（<code>actmaton run &lt;n&gt; --dry-run</code>）。コストをかけずに「何をさせるつもりか」が確認できます。</dd>
+
+  <dt>Fusion（フュージョン）</dt>
+  <dd>Copilot のモデル自動振り分けの仕組み。ティアは Standard（Auto Balance：タスクに応じてモデルを選び、今回のテストでは gpt-6-luna が選ばれた）、High（HydraFusion）、Max（HydraFusion Max）があります。ただし High / Max は現在のアカウントでは使えません。</dd>
+
+  <dt>自己修復（self-repair）</dt>
+  <dd>テストが落ちたとき、失敗出力を次のセッションへ渡して直させる仕組み。上限回数つきです（PR #31 マージ待ち）。</dd>
+
+  <dt>dogfooding（ドッグフーディング）</dt>
+  <dd>自分の製品を自分で使うこと。actmaton は自分のリポジトリの開発に actmaton 自身を使い、その過程で弱点を洗い出しています。</dd>
+
+  <dt>ガードレール</dt>
+  <dd>「やってよい範囲」を自動で囲う仕組みの総称。権限スコープ、シェルガード、停止条件などが該当します。安全を人の注意力ではなく構造で確保するための考え方です。</dd>
+</dl>
+
+<footer id="about-doc">
+  <h2 style="border:none; margin-top:0; font-size:20px">このドキュメントについて</h2>
+  <p>
+    このページは actmaton のユーザーマニュアルです。内容は <strong>2026-11-14 時点</strong>の状態をもとにしています
+    （対象は <code>actmaton 0.1.0</code> 系）。
+  </p>
+  <p>
+    <span class="badge pending">PR #xx マージ待ち</span> と付いている項目は、実装が完了し PR がレビュー待ちの状態にある機能です。
+    マージされるまでは、main ブランチの actmaton ではまだ使えません。
+    <span class="badge done">PR #xx 実装済み</span> は main に取り込み済みの機能です。
+  </p>
+  <p>
+    機能が追加・変更されたら、このドキュメントも同じ PR で更新する運用にしています。
+    実装の詳細な経緯や作業メモはドキュメントには含めず、リポジトリ外の作業記録に置いています（README は製品の顔として簡潔に保つ、という方針によります）。
+  </p>
+  <p>
+    リポジトリ：<a href="https://github.com/piriwata/actmaton">github.com/piriwata/actmaton</a>
+  </p>
+</footer>
+
+</main>
+</div>
+</body>
+</html>
