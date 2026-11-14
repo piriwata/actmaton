@@ -306,7 +306,18 @@ fn build_prompt(issue: &Issue) -> String {
          - Make all changes inside this worktree only. Do not read or write paths outside it.\n\
          - Do NOT run git commit, git push, or gh commands. Leave changes uncommitted.\n\
          - Keep the change minimal and focused on the issue's acceptance criteria.\n\
-         - After implementing, run `cargo test` and make sure it passes before finishing.",
+         - After implementing, run `cargo test` and make sure it passes before finishing.\n\n\
+         How to edit (important):\n\
+         - Edit files ONLY with the write/edit tools, in small steps (one file or one function at a time).\n\
+         - NEVER modify files through shell commands: no heredocs, no sed/awk/perl/python \
+         scripts that rewrite files, no echo/cat redirection into files. Shell edits like that \
+         are denied by the permission policy.\n\
+         - Use shell only for `cargo build` / `cargo test` and small read-only inspections \
+         (git status/diff/log, ls, grep).\n\
+         - If a shell command is denied, do not retry it in another form and do not give up: \
+         switch to the write/edit tools and continue.\n\
+         - If you truly cannot complete the task, say exactly what blocked you in your \
+         final message instead of finishing silently.",
         number = issue.number,
         title = issue.title,
         body = issue.body,
