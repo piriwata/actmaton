@@ -11,6 +11,7 @@ use std::time::Duration;
 use github_copilot_sdk::handler::ApproveAllHandler;
 use github_copilot_sdk::{Client, ClientOptions, MessageOptions, SessionConfig};
 
+mod loop_cmd;
 mod propose;
 mod run_loop;
 
@@ -31,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Some("propose") => propose::propose().await?,
+        Some("loop") => loop_cmd::run_loop(&args[2..]).await?,
         _ => println!("{USAGE}"),
     }
     Ok(())
@@ -41,7 +43,9 @@ usage: actmaton --version          # print the actmaton version
        actmaton spike              # run the Copilot SDK hello-world spike
        actmaton run <issue|url>    # run the M0 loop for one GitHub issue
        actmaton run <issue|url> --dry-run  # print prompt and permission policy; no model call
-       actmaton propose            # draft the next task as an actmaton-proposal issue";
+       actmaton propose            # draft the next task as an actmaton-proposal issue
+       actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N]
+                                   # autonomous loop: run oldest non-`hold` issue (or propose), push, open draft PR";
 
 fn version_string() -> String {
     format!("actmaton {}", env!("CARGO_PKG_VERSION"))

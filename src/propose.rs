@@ -22,6 +22,11 @@ const LABEL: &str = "actmaton-proposal";
 const SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub async fn propose() -> Result<(), Box<dyn std::error::Error>> {
+    propose_issue().await.map(|_| ())
+}
+
+/// Draft and file a proposal; returns the new issue's URL.
+pub async fn propose_issue() -> Result<String, Box<dyn std::error::Error>> {
     let root = repo_root()?;
     println!("repo root: {}", root.display());
 
@@ -56,7 +61,7 @@ pub async fn propose() -> Result<(), Box<dyn std::error::Error>> {
     println!("issue: {url}");
     println!("next step: review the proposal; close it, or run `actmaton run <n>`.");
     println!("=================================================");
-    Ok(())
+    Ok(url)
 }
 
 fn command_output(cmd: &mut Command, what: &str) -> Result<String, Box<dyn std::error::Error>> {
