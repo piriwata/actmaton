@@ -249,14 +249,45 @@ fn scan_todos(dir: &Path, root: &Path) -> Vec<String> {
             out.extend(scan_todos(&p, root));
         } else if let Ok(text) = std::fs::read_to_string(&p) {
             let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();
-            for (i, line) in text.lines().enumerate() {
-                if line.contains("TODO") || line.contains("FIXME") {
-                    out.push(format!("{rel}:{}: {}", i + 1, line.trim()));
-                }
-            }
+            out.extend(todo_entries(&text, &rel));
         }
     }
     out
+}
+
+/// `file:line: text` entries for each TODO/FIXME line in `text`.
+fn todo_entries(text: &str, rel: &str) -> Vec<String> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("TODO") || line.contains("FIXME"))
+        .map(|(i, line)| format!("{rel}:{}: {}", i + 1, line.trim()))
+        .collect()
+}
+
+#[cfg(test)]
+mod todo_tests {
+    use super::todo_entries;
+
+    #[test]
+    fn todo_has_one_based_line_number() {
+        let text = "fn a() {}\n\n    // TODO: fix\n";
+        assert_eq!(todo_entries(text, "src/a.rs"), vec!["src/a.rs:3: // TODO: fix"]);
+    }
+
+    #[test]
+    fn fixme_is_reported() {
+        assert_eq!(todo_entries("// FIXME x", "b.rs"), vec!["b.rs:1: // FIXME x"]);
+    }
+
+    #[test]
+    fn lines_without_markers_are_ignored() {
+        assert!(todo_entries("let a = 1;\n// note\n", "c.rs").is_empty());
+    }
+
+    #[test]
+    fn empty_input_yields_nothing() {
+        assert!(todo_entries("", "d.rs").is_empty());
+    }
 }
 
 fn build_prompt(snapshot: &str) -> String {
