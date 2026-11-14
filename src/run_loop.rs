@@ -19,6 +19,8 @@ use github_copilot_sdk::{
 };
 use serde_json::Value;
 
+use crate::model::{resolved_model, with_fallback, Attempt, ModelConfig, Role};
+
 const REPO: &str = "piriwata/actmaton";
 const SESSION_TIMEOUT: Duration = Duration::from_secs(1200);
 
@@ -397,29 +399,72 @@ async fn run_session(
         .canonicalize()
         .unwrap_or_else(|_| worktree.to_path_buf());
 
-    let perm_log = log.clone();
     let client = Client::start(ClientOptions::default()).await?;
-    let session = client
-        .create_session(
-            SessionConfig::default()
-                .with_working_directory(worktree)
-                .with_permission_handler(Arc::new(ScopedPermissionHandler {
-                    root,
-                    log: perm_log,
-                })),
-        )
-        .await?;
-
-    println!("copilot session started; sending task for issue #{}", issue.number);
-    log_line(log, "copilot session started; task sent".to_string());
-    let reply = session
-        .send_and_wait(MessageOptions::new(prompt).with_wait_timeout(SESSION_TIMEOUT))
-        .await?;
-    log_line(log, "session finished".to_string());
-
-    session.disconnect().await?;
+    let (config, warnings) = ModelConfig::from_env(Role::Run);
+    for w in warnings {
+        eprintln!("warning: {w}");
+        log_line(log, format!("warning: {w}"));
+    }
+    let mut notes = Vec::new();
+    let result = with_fallback(&config, &mut notes, |mc| {
+        let root = root.clone();
+        let prompt = prompt.clone();
+        let client = &client;
+        async move {
+            let session = client
+                .create_session(mc.apply(
+                    SessionConfig::default()
+                        .with_working_directory(worktree)
+                        .with_permission_handler(Arc::new(ScopedPermissionHandler {
+                            root,
+                            log: log.clone(),
+                        })),
+                ))
+                .await?;
+            let resolved = Arc::new(Mutex::new(None::<String>));
+            let mut events = session.subscribe();
+            let seen = resolved.clone();
+            let watcher = tokio::spawn(async move {
+                while let Ok(ev) = events.recv().await {
+                    if let Some(m) = resolved_model(&ev) {
+                        *seen.lock().unwrap() = Some(m);
+                    }
+                }
+            });
+            println!("copilot session started; sending task for issue #{}", issue.number);
+            log_line(log, "copilot session started; task sent".to_string());
+            let reply = session
+                .send_and_wait(MessageOptions::new(prompt).with_wait_timeout(SESSION_TIMEOUT))
+                .await;
+            watcher.abort();
+            session.disconnect().await.ok();
+            let reply = reply?;
+            let resolved_model = resolved.lock().unwrap().clone();
+            Ok(Attempt {
+                value: reply.as_ref().and_then(final_message_text),
+                resolved_model,
+            })
+        }
+    })
+    .await;
+    for n in notes {
+        log_line(log, n);
+    }
     client.stop().await.ok();
-    Ok(reply.as_ref().and_then(final_message_text))
+    let attempt = result?;
+    log_line(
+        log,
+        format!(
+            "resolved model: {}",
+            attempt.resolved_model.as_deref().unwrap_or("(not reported)")
+        ),
+    );
+    println!(
+        "resolved model: {}",
+        attempt.resolved_model.as_deref().unwrap_or("(not reported)")
+    );
+    log_line(log, "session finished".to_string());
+    Ok(attempt.value)
 }
 
 // ---------------------------------------------------------------------------

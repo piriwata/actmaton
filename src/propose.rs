@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use github_copilot_sdk::{
@@ -15,6 +16,7 @@ use github_copilot_sdk::{
 };
 use serde_json::Value;
 
+use crate::model::{resolved_model, with_fallback, Attempt, ModelConfig, Role};
 use crate::run_loop::{final_message_text, path_within, payload_target_path, repo_root};
 
 const REPO: &str = "piriwata/actmaton";
@@ -28,8 +30,8 @@ pub async fn propose() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = gather_snapshot(&root)?;
     let prompt = build_prompt(&snapshot);
 
-    let reply = run_session(&root, &prompt).await?;
-    let log_path = write_log(&root, &prompt, reply.as_deref())?;
+    let (reply, notes) = run_session(&root, &prompt).await?;
+    let log_path = write_log(&root, &prompt, reply.as_deref(), &notes)?;
     println!("propose log: {}", log_path.display());
 
     let reply = reply.ok_or("session returned no final message")?;
@@ -311,6 +313,7 @@ fn write_log(
     root: &Path,
     prompt: &str,
     reply: Option<&str>,
+    notes: &[String],
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = root
         .parent()
@@ -324,34 +327,75 @@ fn write_log(
     std::fs::write(
         &path,
         format!(
-            "== prompt ==\n{prompt}\n\n== reply ==\n{}\n",
+            "== model ==\n{}\n\n== prompt ==\n{prompt}\n\n== reply ==\n{}\n",
+            notes.join("\n"),
             reply.unwrap_or("(no final message)")
         ),
     )?;
     Ok(path)
 }
 
-async fn run_session(root: &Path, prompt: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+async fn run_session(
+    root: &Path,
+    prompt: &str,
+) -> Result<(Option<String>, Vec<String>), Box<dyn std::error::Error>> {
     let scope = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let client = Client::start(ClientOptions::default()).await?;
-    let session = client
-        .create_session(
-            SessionConfig::default()
-                .with_working_directory(root)
-                .approve_permissions_if(move |data| {
-                    let (allowed, line) = propose_permission(&scope, data);
-                    eprintln!("{line}");
-                    allowed
-                }),
-        )
-        .await?;
-    println!("copilot session started (read-only); requesting a proposal");
-    let reply = session
-        .send_and_wait(MessageOptions::new(prompt).with_wait_timeout(SESSION_TIMEOUT))
-        .await?;
-    session.disconnect().await?;
+    let (config, warnings) = ModelConfig::from_env(Role::Propose);
+    let mut notes = Vec::new();
+    for w in warnings {
+        eprintln!("warning: {w}");
+        notes.push(format!("warning: {w}"));
+    }
+    let result = with_fallback(&config, &mut notes, |mc| {
+        let scope = scope.clone();
+        let client = &client;
+        async move {
+            let session = client
+                .create_session(mc.apply(
+                    SessionConfig::default()
+                        .with_working_directory(root)
+                        .approve_permissions_if(move |data| {
+                            let (allowed, line) = propose_permission(&scope, data);
+                            eprintln!("{line}");
+                            allowed
+                        }),
+                ))
+                .await?;
+            let resolved = Arc::new(Mutex::new(None::<String>));
+            let mut events = session.subscribe();
+            let seen = resolved.clone();
+            let watcher = tokio::spawn(async move {
+                while let Ok(ev) = events.recv().await {
+                    if let Some(m) = resolved_model(&ev) {
+                        *seen.lock().unwrap() = Some(m);
+                    }
+                }
+            });
+            println!("copilot session started (read-only); requesting a proposal");
+            let reply = session
+                .send_and_wait(MessageOptions::new(prompt).with_wait_timeout(SESSION_TIMEOUT))
+                .await;
+            watcher.abort();
+            session.disconnect().await.ok();
+            let reply = reply?;
+            let resolved_model = resolved.lock().unwrap().clone();
+            Ok(Attempt {
+                value: reply.as_ref().and_then(final_message_text),
+                resolved_model,
+            })
+        }
+    })
+    .await;
     client.stop().await.ok();
-    Ok(reply.as_ref().and_then(final_message_text))
+    let attempt = result?;
+    let line = format!(
+        "resolved model: {}",
+        attempt.resolved_model.as_deref().unwrap_or("(not reported)")
+    );
+    println!("{line}");
+    notes.push(line);
+    Ok((attempt.value, notes))
 }
 
 fn propose_permission(root: &Path, data: &PermissionRequestData) -> (bool, String) {
