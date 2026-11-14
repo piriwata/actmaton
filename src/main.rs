@@ -11,6 +11,7 @@ use std::time::Duration;
 use github_copilot_sdk::handler::ApproveAllHandler;
 use github_copilot_sdk::{Client, ClientOptions, MessageOptions, SessionConfig};
 
+mod propose;
 mod run_loop;
 
 #[tokio::main]
@@ -26,11 +27,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(2);
             }
         },
+        Some("propose") => propose::propose().await?,
         _ => {
             println!("actmaton (M0 seed)");
             println!("usage: actmaton --version          # print the actmaton version");
             println!("       actmaton spike              # run the Copilot SDK hello-world spike");
             println!("       actmaton run <issue|url>    # run the M0 loop for one GitHub issue");
+            println!("       actmaton propose            # draft the next task as an actmaton-proposal issue");
         }
     }
     Ok(())
