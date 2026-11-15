@@ -108,6 +108,7 @@ pub(crate) struct Outcome {
     pub worktree: PathBuf,
     pub tests_ok: bool,
     pub final_message: Option<String>,
+    pub model: Option<String>,
     pub log_path: PathBuf,
 }
 
@@ -129,7 +130,7 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
     println!("worktree: {}", worktree.display());
     log_line(&log, format!("worktree created: {} (branch {branch})", worktree.display()));
 
-    let mut final_message = run_session(issue, build_prompt(issue), &worktree, &log).await?;
+    let (mut final_message, mut model) = run_session(issue, build_prompt(issue), &worktree, &log).await?;
 
     // Post-session verification, run by us (not the agent).
     log_line(&log, "running cargo test in worktree".to_string());
@@ -140,8 +141,11 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
         println!("cargo test failed; repair attempt {attempt}/{MAX_REPAIR_ATTEMPTS}");
         log_line(&log, format!("repair attempt {attempt}/{MAX_REPAIR_ATTEMPTS}: starting follow-up session"));
         let prompt = build_repair_prompt(issue, attempt, &test_tail);
-        let reply = run_session(issue, prompt, &worktree, &log).await?;
+        let (reply, reply_model) = run_session(issue, prompt, &worktree, &log).await?;
         let summary = one_line_summary(reply.as_deref());
+        if reply_model.is_some() {
+            model = reply_model;
+        }
         if reply.is_some() {
             final_message = reply;
         }
@@ -191,6 +195,7 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
         worktree,
         tests_ok,
         final_message,
+        model,
         log_path,
     })
 }
@@ -460,7 +465,7 @@ async fn run_session(
     prompt: String,
     worktree: &Path,
     log: &RunLog,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error>> {
     let root = worktree
         .canonicalize()
         .unwrap_or_else(|_| worktree.to_path_buf());
@@ -530,7 +535,7 @@ async fn run_session(
         attempt.resolved_model.as_deref().unwrap_or("(not reported)")
     );
     log_line(log, "session finished".to_string());
-    Ok(attempt.value)
+    Ok((attempt.value, attempt.resolved_model))
 }
 
 // ---------------------------------------------------------------------------
