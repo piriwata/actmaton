@@ -16,6 +16,10 @@ Actmaton uses a Rust/Tokio control loop and the [GitHub Copilot SDK](https://git
 
 GitHub Issues, PRs, and CI hold the backlog, decisions, and results. The initial target is a **16 GB Apple Silicon Mac mini or MacBook**, using [TUFF](https://github.com/tuff-app/TUFF) to serve the local coding model.
 
+### Loop verdict
+
+`actmaton loop` records one verdict per iteration: **FAIL** when `cargo test` fails; **PASS** when tests pass and every item under the issue's "Done criteria"/"Acceptance" section is reported `VERIFIED` by the session (also when the issue states none); otherwise **PARTIAL**. The session must end with one `CRITERION <n>: VERIFIED|NOT-VERIFIED|HUMAN-CHECK - <how/why>` line per criterion; unaddressed criteria count as not verified. PARTIAL runs still open a draft PR, with the unverified criteria (marked `human-check` where not machine-checkable) listed in the loop report and PR body.
+
 ## Roadmap
 
 - [x] **M0 — Seed:** the minimal agent loop, built from outside Actmaton: read one Issue, edit in a worktree, test, open a draft PR.

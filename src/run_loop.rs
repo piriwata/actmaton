@@ -109,6 +109,7 @@ pub(crate) struct Outcome {
     pub tests_ok: bool,
     pub final_message: Option<String>,
     pub log_path: PathBuf,
+    pub criteria: Vec<String>,
 }
 
 /// Run an issue by number: fetch it (fresh, so new comments are honored)
@@ -183,6 +184,12 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
     println!("{}", if diff_stat.trim().is_empty() { "  (none)" } else { &diff_stat });
     println!("cargo test: {}", if tests_ok { "PASS" } else { "FAIL" });
     println!("--- cargo test output (tail) ---\n{test_tail}");
+    let criteria = parse_criteria(&issue.body);
+    let verdict = decide_verdict(tests_ok, &criteria, final_message.as_deref());
+    println!("verdict: {}", verdict.label());
+    if let Verdict::Partial(_) = verdict {
+        println!("unverified criteria:\n{}", verdict.unverified_text());
+    }
 
     Ok(Outcome {
         title: issue.title.clone(),
@@ -192,6 +199,7 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
         tests_ok,
         final_message,
         log_path,
+        criteria,
     })
 }
 
@@ -437,11 +445,12 @@ fn build_prompt(issue: &Issue) -> String {
          - If a shell command is denied, do not retry it in another form and do not give up: \
          switch to the write/edit tools and continue.\n\
          - If you truly cannot complete the task, say exactly what blocked you in your \
-         final message instead of finishing silently.",
+         final message instead of finishing silently.{criteria}",
         number = issue.number,
         title = issue.title,
         body = issue.body,
         comments = comments_section(&issue.comments),
+        criteria = criteria_prompt_section(&parse_criteria(&issue.body)),
     )
 }
 
@@ -881,9 +890,150 @@ fn cargo_test(dir: &Path) -> (bool, String) {
     }
 }
 
+/// Done/acceptance criteria stated in an issue body: the list items under a
+/// heading (or `Name:` line) mentioning "done criteria" or "acceptance".
+pub(crate) fn parse_criteria(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in body.lines().map(str::trim) {
+        let is_heading = line.starts_with('#');
+        let lower = line.to_lowercase();
+        let names_criteria = lower.contains("done criteria") || lower.contains("acceptance");
+        if is_heading || (line.ends_with(':') && names_criteria) {
+            in_section = names_criteria;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let item = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .map(|s| {
+                let s = s.trim_start();
+                ["[ ] ", "[x] ", "[X] "].iter().find_map(|p| s.strip_prefix(p)).unwrap_or(s)
+            });
+        if let Some(item) = item.filter(|i| !i.trim().is_empty()) {
+            out.push(item.trim().to_string());
+        }
+    }
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Pass,
+    /// Tests pass, but these criteria are not verified (`(criterion, human_check)`).
+    Partial(Vec<(String, bool)>),
+    Fail,
+}
+
+impl Verdict {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Verdict::Pass => "PASS",
+            Verdict::Partial(_) => "PARTIAL",
+            Verdict::Fail => "FAIL",
+        }
+    }
+
+    /// Unverified criteria rendered for the loop report and PR body.
+    pub(crate) fn unverified_text(&self) -> String {
+        match self {
+            Verdict::Partial(u) => u
+                .iter()
+                .map(|(c, human)| format!("- {c} [{}]", if *human { "human-check" } else { "not verified" }))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Status the session reported for criterion `n` (1-based), via a line like
+/// `CRITERION 2: VERIFIED - ...`, `NOT-VERIFIED`, or `HUMAN-CHECK`.
+fn criterion_status(final_message: &str, n: usize) -> Option<&'static str> {
+    let tag = format!("criterion {n}:");
+    final_message.lines().find_map(|l| {
+        let l = l.trim().trim_start_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        let rest = l.strip_prefix(&tag)?.trim_start();
+        let rest = rest.trim_start_matches(|c: char| !c.is_alphanumeric());
+        if rest.starts_with("not-verified") || rest.starts_with("not verified") {
+            Some("not")
+        } else if rest.starts_with("human-check") || rest.starts_with("human check") {
+            Some("human")
+        } else if rest.starts_with("verified") {
+            Some("verified")
+        } else {
+            None
+        }
+    })
+}
+
+/// PASS only when tests pass and every stated criterion is reported VERIFIED;
+/// an unaddressed criterion counts as not verified.
+pub(crate) fn decide_verdict(tests_ok: bool, criteria: &[String], final_message: Option<&str>) -> Verdict {
+    if !tests_ok {
+        return Verdict::Fail;
+    }
+    let msg = final_message.unwrap_or("");
+    let unverified: Vec<(String, bool)> = criteria
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| match criterion_status(msg, i + 1) {
+            Some("verified") => None,
+            Some("human") => Some((c.clone(), true)),
+            _ => Some((c.clone(), false)),
+        })
+        .collect();
+    if unverified.is_empty() { Verdict::Pass } else { Verdict::Partial(unverified) }
+}
+
+fn criteria_prompt_section(criteria: &[String]) -> String {
+    if criteria.is_empty() {
+        return String::new();
+    }
+    let list: String = criteria.iter().enumerate().map(|(i, c)| format!("{}. {c}\n", i + 1)).collect();
+    format!(
+        "\n\nStated done criteria (numbered):\n{list}\n\
+         Check every criterion that can be checked mechanically (e.g. run the revert/negative \
+         check) instead of narrating it. Your final message MUST contain one line per criterion, \
+         exactly in the form `CRITERION <n>: VERIFIED - <how>`, `CRITERION <n>: NOT-VERIFIED - <why>`, \
+         or `CRITERION <n>: HUMAN-CHECK - <why it is not machine-checkable>`. Never claim VERIFIED \
+         for something you did not actually run."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn criteria_parsed_from_acceptance_section_only() {
+        let body = "## Scope\n- not this\n\n## Acceptance\n- [ ] A fails\n- cargo test passes\n\nprose\n## Other\n- no";
+        assert_eq!(parse_criteria(body), vec!["A fails", "cargo test passes"]);
+        assert!(parse_criteria("Plain issue\n- a bullet\n").is_empty());
+        assert_eq!(parse_criteria("Done criteria:\n* x\n"), vec!["x"]);
+    }
+
+    #[test]
+    fn verdict_maps_tests_and_criteria() {
+        let c = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(decide_verdict(false, &c, Some("CRITERION 1: VERIFIED")), Verdict::Fail);
+        assert_eq!(decide_verdict(true, &[], None), Verdict::Pass);
+        let ok = "CRITERION 1: VERIFIED - ran it\n- CRITERION 2: VERIFIED - ok";
+        assert_eq!(decide_verdict(true, &c, Some(ok)), Verdict::Pass);
+        let mixed = "CRITERION 1: NOT-VERIFIED - skipped\nCRITERION 2: HUMAN-CHECK - visual";
+        assert_eq!(
+            decide_verdict(true, &c, Some(mixed)),
+            Verdict::Partial(vec![("a".into(), false), ("b".into(), true)])
+        );
+        // unaddressed criterion is not verified
+        assert_eq!(
+            decide_verdict(true, &c, Some("CRITERION 1: VERIFIED")),
+            Verdict::Partial(vec![("b".into(), false)])
+        );
+    }
 
     #[test]
     fn repair_decision_stops_on_pass() {

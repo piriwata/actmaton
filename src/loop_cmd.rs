@@ -4,9 +4,14 @@
 //! Selection rule: the oldest open issue that is not labeled `hold` and has
 //! not already been attempted in this loop invocation. If none exists,
 //! `propose` files a new issue, which becomes that iteration's work.
-//! After a passing run the branch is pushed and a *draft* PR is opened here,
+//! After a non-failing run the branch is pushed and a *draft* PR is opened here,
 //! in the orchestrator process (never inside the agent session). Merging is
 //! left to the user.
+//!
+//! Verdict: FAIL if `cargo test` fails; PASS if tests pass and every done/
+//! acceptance criterion in the issue is reported `VERIFIED` by the session
+//! (or the issue states none); otherwise PARTIAL, with the `NOT-VERIFIED` /
+//! `HUMAN-CHECK` criteria named in the loop report and the PR body.
 
 use std::io::Write;
 use std::path::Path;
@@ -15,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::run_loop::{git, repo_root, run_number};
+use crate::run_loop::{decide_verdict, git, repo_root, run_number, Verdict};
 
 const REPO: &str = "piriwata/actmaton";
 const HOLD_LABEL: &str = "hold";
@@ -192,18 +197,27 @@ async fn do_iteration(
     let label = format!("#{number}");
     let o = run_number(number).await.map_err(|e| (label.clone(), e))?;
     let summary = one_line(o.final_message.as_deref().unwrap_or(""));
-    if !o.tests_ok {
+    let verdict = decide_verdict(o.tests_ok, &o.criteria, o.final_message.as_deref());
+    if verdict == Verdict::Fail {
         return Ok((format!("#{number} {}", o.title), "FAIL (tests failing)".into(), "-".into(), summary));
     }
+    let unverified = match &verdict {
+        Verdict::Partial(_) => format!("\nVerdict: PARTIAL. Unverified criteria:\n{}", verdict.unverified_text()),
+        _ => String::new(),
+    };
     let body = format!(
-        "{}\n\nIssue: {}\nRun log: `{}`\nTests: PASS",
+        "{}\n\nIssue: {}\nRun log: `{}`\nTests: PASS{unverified}",
         o.final_message.as_deref().unwrap_or("(no final message)"),
         o.url,
         o.log_path.display()
     );
     let pr = push_and_open_draft_pr(&o.worktree, &o.branch, number, &o.title, &body)
         .map_err(|e| (label, e))?;
-    Ok((format!("#{number} {}", o.title), "PASS".into(), pr, summary))
+    let summary = match verdict {
+        Verdict::Partial(_) => format!("{summary} | unverified: {}", verdict.unverified_text().replace('\n', " ")),
+        _ => summary,
+    };
+    Ok((format!("#{number} {}", o.title), verdict.label().into(), pr, summary))
 }
 
 pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -237,7 +251,7 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         let model = "default";
         let line = match do_iteration(&action, &mut history.attempted).await {
             Ok((issue, verdict, pr, summary)) => {
-                if verdict == "PASS" {
+                if !verdict.starts_with("FAIL") {
                     history.consecutive_failures = 0;
                 } else {
                     history.consecutive_failures += 1;
