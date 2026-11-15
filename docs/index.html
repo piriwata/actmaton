@@ -213,6 +213,17 @@
   <tr><td><code>--budget-minutes N</code></td><td>実行時間の予算（既定 240 分）</td></tr>
 </table>
 
+<h3>コンフリクトの自動修復</h3>
+<p>
+  各イテレーションの前に、actmaton 自身のブランチ（<code>actmaton/issue-*</code>）の open な PR を調べ、
+  <code>CONFLICTING</code> のものがあれば<strong>その PR 自身のブランチ</strong>で修復します（置き換えの PR や修復用の Issue は作りません）。
+  ベース（main または dev）をブランチへマージし、両側の意図を保ってコンフリクトを解消し、<code>cargo test</code> が通れば、
+  オーケストレーターが未完了のマージ（解消済みなのに index が UU のまま）を確定して<strong>同じブランチへ push</strong> します（force push はしません）。
+  修復は 1 つの PR につき 1 loop 実行で 1 回だけです。テストが落ちる、または両側が同じロジックを書き換えている場合は強行せず、
+  マージを破棄してレポートに目立つ形（<code>REPAIR FAILED</code>）で記録します。
+  PR にはコンフリクトしたファイル、解消方法、テスト結果がコメントされます。
+</p>
+
 <h3>レポート</h3>
 <p>
   イテレーションごとに、実際に解決されたモデル、合否、PR のリンク、1行要約（長い場合は単語の区切りで <code>…</code> を付けて省略）が
