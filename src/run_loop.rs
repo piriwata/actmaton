@@ -200,6 +200,115 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
     })
 }
 
+/// Result of one conflict-repair attempt on a PR branch.
+pub(crate) struct RepairOutcome {
+    pub files: Vec<String>,
+    pub tests_ok: bool,
+    pub pushed: bool,
+    pub summary: String,
+}
+
+fn unmerged_files(worktree: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(git(worktree, &["diff", "--name-only", "--diff-filter=U"])?
+        .lines()
+        .map(String::from)
+        .collect())
+}
+
+fn has_conflict_markers(text: &str) -> bool {
+    text.lines().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> "))
+}
+
+fn build_conflict_prompt(pr: u64, branch: &str, base: &str, files: &[String]) -> String {
+    format!(
+        "You are repairing merge conflicts on the branch `{branch}` of PR #{pr} in its own git \
+         worktree (your working directory). `origin/{base}` has already been merged into the \
+         branch and stopped with conflicts in:\n{list}\n\n\
+         Resolve each conflict preserving the intent of BOTH sides: keep the PR's own changes and \
+         incorporate what {base} changed. Never resolve by discarding the PR's changes wholesale; \
+         if {base}'s version should simply win for a file, say why in your summary. If both sides \
+         rewrote the same logic and the resolution is not mechanical, do not guess: leave the \
+         conflict markers in place and explain in your final message.\n\n\
+         Rules: edit files only with the write/edit tools (never via shell); stay inside the \
+         worktree; no git push, no gh, no force operations, do not touch main. When a file is \
+         fully resolved run `git add <path>` for it, then run `cargo test` and make sure it passes. \
+         The orchestrator concludes the merge commit and pushes. Your final message must list, \
+         per conflicted file, how it was resolved.",
+        list = files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"),
+    )
+}
+
+/// Merge `origin/<base>` into the PR's own branch, have a session resolve
+/// conflicts, verify with `cargo test`, then conclude the merge and push to
+/// the same branch (never forced). On any failure the merge attempt is
+/// discarded so the branch is left as it was.
+pub(crate) async fn repair_conflict(
+    pr: u64,
+    branch: &str,
+    base: &str,
+) -> Result<RepairOutcome, Box<dyn std::error::Error>> {
+    let root = repo_root()?;
+    let dir_name = branch.rsplit('/').next().unwrap_or(branch);
+    let worktree = root.parent().ok_or("repo root has no parent directory")?.join(dir_name);
+    let remote = format!("origin/{branch}");
+    git(&root, &["fetch", "origin"])?;
+    if worktree.exists() {
+        if !git(&worktree, &["status", "--porcelain"])?.is_empty() {
+            return Err(format!("worktree {} has uncommitted changes; not touching it", worktree.display()).into());
+        }
+        if git(&worktree, &["merge-base", "--is-ancestor", &remote, "HEAD"]).is_err() {
+            return Err(format!("local {branch} is behind/diverged from {remote}; not touching it").into());
+        }
+    } else {
+        let wt = worktree.to_str().ok_or("worktree path is not UTF-8")?;
+        git(&root, &["worktree", "add", "-B", branch, wt, &remote])?;
+    }
+
+    let before = git(&worktree, &["rev-parse", "HEAD"])?;
+    let _ = git(&worktree, &["merge", "--no-edit", &format!("origin/{base}")]);
+    let files = unmerged_files(&worktree)?;
+    let fail = |msg: String, files: Vec<String>| {
+        let _ = git(&worktree, &["reset", "--hard", &before]);
+        Ok(RepairOutcome { files, tests_ok: false, pushed: false, summary: msg })
+    };
+
+    let mut summary = String::from("merged cleanly, no textual conflicts");
+    if !files.is_empty() {
+        let issue = Issue {
+            number: pr,
+            title: format!("conflict repair for PR #{pr}"),
+            body: String::new(),
+            url: String::new(),
+            comments: Vec::new(),
+        };
+        let log: RunLog = Arc::new(Mutex::new(Vec::new()));
+        let (reply, _) =
+            run_session(&issue, build_conflict_prompt(pr, branch, base, &files), &worktree, &log).await?;
+        summary = reply.unwrap_or_else(|| "(no final message)".into());
+        // Sessions often resolve on disk but leave the index at UU: stage those.
+        for f in unmerged_files(&worktree)? {
+            let text = std::fs::read_to_string(worktree.join(&f)).unwrap_or_default();
+            if has_conflict_markers(&text) {
+                return fail(format!("non-mechanical conflict left in {f}; {summary}"), files);
+            }
+            git(&worktree, &["add", "--", &f])?;
+        }
+    }
+    let (tests_ok, tail) = cargo_test(&worktree);
+    if !tests_ok {
+        return fail(format!("cargo test failed after merge:\n{tail}"), files);
+    }
+    if git(&worktree, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok() {
+        git(&worktree, &["add", "-A"])?;
+        git(&worktree, &["commit", "--no-edit"])?;
+    }
+    if git(&worktree, &["rev-parse", "HEAD"])? == before {
+        return Ok(RepairOutcome { files, tests_ok, pushed: false, summary: "nothing to merge".into() });
+    }
+    git(&worktree, &["push", "origin", branch])?;
+    Ok(RepairOutcome { files, tests_ok, pushed: true, summary })
+}
+
 /// Accept `3`, `#3`, or a full issue URL (`.../issues/3`).
 fn parse_issue_ref(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let trimmed = s.trim().trim_end_matches('/');
@@ -888,6 +997,12 @@ fn cargo_test(dir: &Path) -> (bool, String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn detects_conflict_markers() {
+        assert!(super::has_conflict_markers("a\n<<<<<<< HEAD\nx\n"));
+        assert!(!super::has_conflict_markers("Title\n=======\nfine\n"));
+    }
+
     use super::*;
 
     #[test]

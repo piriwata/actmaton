@@ -80,6 +80,95 @@ pub fn plan(board: &[BoardIssue], history: &History, limits: &Limits, elapsed: D
     }
 }
 
+const BRANCH_PREFIX: &str = "actmaton/issue-";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenPr {
+    pub number: u64,
+    pub branch: String,
+    pub base: String,
+    pub mergeable: String,
+}
+
+/// Open PRs eligible for conflict repair: actmaton's own branches only,
+/// conflicting only, and not already attempted in this invocation.
+pub fn repair_candidates<'a>(prs: &'a [OpenPr], repaired: &[u64]) -> Vec<&'a OpenPr> {
+    prs.iter()
+        .filter(|p| p.branch.starts_with(BRANCH_PREFIX))
+        .filter(|p| p.mergeable == "CONFLICTING")
+        .filter(|p| !repaired.contains(&p.number))
+        .collect()
+}
+
+fn fetch_open_prs() -> Result<Vec<OpenPr>, Box<dyn std::error::Error>> {
+    let out = Command::new("gh")
+        .args([
+            "pr", "list", "--repo", REPO, "--state", "open", "--limit", "100", "--json",
+            "number,headRefName,baseRefName,mergeable",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("gh pr list failed: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)?;
+    Ok(v.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|p| OpenPr {
+                    number: p["number"].as_u64().unwrap_or(0),
+                    branch: p["headRefName"].as_str().unwrap_or_default().to_string(),
+                    base: p["baseRefName"].as_str().unwrap_or("main").to_string(),
+                    mergeable: p["mergeable"].as_str().unwrap_or_default().to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Repair each eligible conflicting PR once, comment on it, and return report lines.
+async fn maintain(report_path: &Path, repaired: &mut Vec<u64>) {
+    let prs = match fetch_open_prs() {
+        Ok(p) => p,
+        Err(e) => {
+            report(report_path, &format!("- maintenance: could not list PRs: {}\n", one_line(&e.to_string())));
+            return;
+        }
+    };
+    let todo: Vec<OpenPr> = repair_candidates(&prs, repaired).into_iter().cloned().collect();
+    for pr in todo {
+        repaired.push(pr.number);
+        let (line, comment) = match crate::run_loop::repair_conflict(pr.number, &pr.branch, &pr.base).await {
+            Ok(o) => {
+                let files = if o.files.is_empty() { "(none)".to_string() } else { o.files.join(", ") };
+                let verdict = match (o.tests_ok, o.pushed) {
+                    (true, true) => "REPAIRED (tests PASS, pushed)",
+                    (true, false) => "no change needed",
+                    _ => "!!! REPAIR FAILED — needs attention (nothing pushed)",
+                };
+                let comment = format!(
+                    "actmaton conflict repair against `{}`\n\nConflict files: {files}\nTests: {}\nPushed: {}\n\nResolution:\n{}",
+                    pr.base,
+                    if o.tests_ok { "PASS" } else { "FAIL" },
+                    o.pushed,
+                    o.summary
+                );
+                (
+                    format!("- maintenance: PR #{} | conflicts: {files} | {verdict} | {}\n", pr.number, one_line(&o.summary)),
+                    comment,
+                )
+            }
+            Err(e) => (
+                format!("- maintenance: PR #{} | !!! REPAIR ERROR — needs attention | {}\n", pr.number, one_line(&e.to_string())),
+                format!("actmaton conflict repair could not run: {e}"),
+            ),
+        };
+        report(report_path, &line);
+        let _ = Command::new("gh")
+            .args(["pr", "comment", &pr.number.to_string(), "--repo", REPO, "--body", &comment])
+            .output();
+    }
+}
+
 fn parse_args(args: &[String]) -> Result<Limits, String> {
     let mut l = Limits::default();
     let mut it = args.iter();
@@ -260,7 +349,9 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
 
     let start = Instant::now();
     let mut history = History::default();
+    let mut repaired: Vec<u64> = Vec::new();
     loop {
+        maintain(&path, &mut repaired).await;
         let board = fetch_board()?;
         let action = plan(&board, &history, &limits, start.elapsed());
         if let Action::Stop(reason) = &action {
@@ -302,6 +393,26 @@ mod tests {
 
     fn lim() -> Limits {
         Limits { max_iterations: 3, max_failures: 2, budget: Duration::from_secs(100) }
+    }
+
+    #[test]
+    fn repair_candidates_filter() {
+        let pr = |n, b: &str, m: &str| OpenPr {
+            number: n,
+            branch: b.into(),
+            base: "main".into(),
+            mergeable: m.into(),
+        };
+        let prs = vec![
+            pr(1, "actmaton/issue-1", "CONFLICTING"),
+            pr(2, "actmaton/issue-2", "MERGEABLE"),
+            pr(3, "someone/feature", "CONFLICTING"),
+            pr(4, "actmaton/issue-4", "CONFLICTING"),
+            pr(5, "actmaton/issue-5", "UNKNOWN"),
+        ];
+        let nums = |r: Vec<&OpenPr>| r.iter().map(|p| p.number).collect::<Vec<_>>();
+        assert_eq!(nums(repair_candidates(&prs, &[])), vec![1, 4]);
+        assert_eq!(nums(repair_candidates(&prs, &[1])), vec![4]);
     }
 
     #[test]

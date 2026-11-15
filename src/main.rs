@@ -51,7 +51,7 @@ usage: actmaton --version          # print the actmaton version
        actmaton propose            # draft the next task as an actmaton-proposal issue
        actmaton propose --dry-run  # print the propose prompt; no model call, no issue created
        actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N]
-                                   # autonomous loop: run oldest non-`hold` issue (or propose), push, open draft PR
+                                   # autonomous loop: first repairs conflicting actmaton PRs on their own branch, then runs oldest non-`hold` issue (or propose), push, open draft PR
 model selection (env vars; unset = auto): ACTMATON_MODEL, ACTMATON_FUSION_TIER (standard|high|max),
        per role: ACTMATON_RUN_MODEL, ACTMATON_PROPOSE_MODEL (and *_FUSION_TIER);
        an unavailable model falls back once to the default and is logged";
