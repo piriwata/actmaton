@@ -143,7 +143,7 @@ fn push_and_open_draft_pr(
         git(worktree, &["commit", "-m", &format!("{title}\n\nRefs #{number}")])?;
     }
     git(worktree, &["push", "-u", "origin", branch])?;
-    let body = format!("Refs #{number}\n\n{summary}");
+    let body = format!("Closes #{number}\n\n{summary}");
     let out = Command::new("gh")
         .args([
             "pr", "create", "--draft", "--repo", REPO, "--head", branch, "--title", title,
@@ -159,7 +159,40 @@ fn push_and_open_draft_pr(
 
 fn one_line(s: &str) -> String {
     let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("(no summary)");
-    line.chars().take(200).collect()
+    truncate_at_word(line, 200)
+}
+
+/// Cut `s` to at most `max` chars at a word boundary, adding an ellipsis.
+fn truncate_at_word(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    let boundary_ok = s.chars().nth(max).is_some_and(char::is_whitespace);
+    let cut = if boundary_ok { cut.as_str() } else { cut.rsplit_once(char::is_whitespace).map_or(cut.as_str(), |(h, _)| h) };
+    format!("{}…", cut.trim_end_matches(|c: char| c.is_whitespace() || ",;:-".contains(c)))
+}
+
+/// Drop session-local status lines (uncommitted / will push / next steps)
+/// that orchestration makes false once the loop commits and opens the PR.
+fn sanitize_pr_body(s: &str) -> String {
+    const STALE: [&str; 7] = [
+        "uncommitted",
+        "not committed",
+        "nothing is committed",
+        "not been committed",
+        "will push",
+        "next step",
+        "left for you",
+    ];
+    let kept: Vec<&str> = s
+        .lines()
+        .filter(|l| {
+            let l = l.to_lowercase();
+            !STALE.iter().any(|p| l.contains(p))
+        })
+        .collect();
+    kept.join("\n").trim().to_string()
 }
 
 fn entry(iter: u32, issue: &str, model: &str, verdict: &str, pr: &str, summary: &str) -> String {
@@ -175,11 +208,11 @@ fn report(path: &Path, text: &str) {
     }
 }
 
-/// One iteration's work; returns (issue label, verdict, pr, summary).
+/// One iteration's work; returns (issue label, model, verdict, pr, summary).
 async fn do_iteration(
     action: &Action,
     attempted: &mut Vec<u64>,
-) -> Result<(String, String, String, String), (String, Box<dyn std::error::Error>)> {
+) -> Result<(String, String, String, String, String), (String, Box<dyn std::error::Error>)> {
     let number = match action {
         Action::Run(n) => *n,
         _ => {
@@ -192,18 +225,19 @@ async fn do_iteration(
     let label = format!("#{number}");
     let o = run_number(number).await.map_err(|e| (label.clone(), e))?;
     let summary = one_line(o.final_message.as_deref().unwrap_or(""));
+    let model = o.model.clone().unwrap_or_else(|| "(not reported)".into());
     if !o.tests_ok {
-        return Ok((format!("#{number} {}", o.title), "FAIL (tests failing)".into(), "-".into(), summary));
+        return Ok((format!("#{number} {}", o.title), model, "FAIL (tests failing)".into(), "-".into(), summary));
     }
     let body = format!(
         "{}\n\nIssue: {}\nRun log: `{}`\nTests: PASS",
-        o.final_message.as_deref().unwrap_or("(no final message)"),
+        sanitize_pr_body(o.final_message.as_deref().unwrap_or("(no final message)")),
         o.url,
         o.log_path.display()
     );
     let pr = push_and_open_draft_pr(&o.worktree, &o.branch, number, &o.title, &body)
         .map_err(|e| (label, e))?;
-    Ok((format!("#{number} {}", o.title), "PASS".into(), pr, summary))
+    Ok((format!("#{number} {}", o.title), model, "PASS".into(), pr, summary))
 }
 
 pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -234,19 +268,18 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             break;
         }
         history.iterations += 1;
-        let model = "default";
         let line = match do_iteration(&action, &mut history.attempted).await {
-            Ok((issue, verdict, pr, summary)) => {
+            Ok((issue, model, verdict, pr, summary)) => {
                 if verdict == "PASS" {
                     history.consecutive_failures = 0;
                 } else {
                     history.consecutive_failures += 1;
                 }
-                entry(history.iterations, &issue, model, &verdict, &pr, &summary)
+                entry(history.iterations, &issue, &model, &verdict, &pr, &summary)
             }
             Err((issue, e)) => {
                 history.consecutive_failures += 1;
-                entry(history.iterations, &issue, model, "ERROR", "-", &one_line(&e.to_string()))
+                entry(history.iterations, &issue, "(not run)", "ERROR", "-", &one_line(&e.to_string()))
             }
         };
         report(&path, &line);
@@ -301,6 +334,17 @@ mod tests {
         assert!(matches!(plan(&board, &h, &lim(), Duration::ZERO), Action::Stop(r) if r.contains("failures")));
         let h = History::default();
         assert!(matches!(plan(&board, &h, &lim(), Duration::from_secs(100)), Action::Stop(r) if r.contains("budget")));
+    }
+
+    #[test]
+    fn sanitizes_pr_body_and_truncates_cleanly() {
+        let body = "Done.\nNothing is committed.\nChanged x.\nLeft uncommitted in worktree.";
+        assert_eq!(sanitize_pr_body(body), "Done.\nChanged x.");
+        assert_eq!(truncate_at_word("short one", 200), "short one");
+        let long = "word ".repeat(100);
+        let t = truncate_at_word(&long, 22);
+        assert_eq!(t, "word word word word…");
+        assert!(one_line(&long).ends_with("word…"));
     }
 
     #[test]
