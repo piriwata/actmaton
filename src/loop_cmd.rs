@@ -140,10 +140,10 @@ fn push_and_open_draft_pr(
 ) -> Result<String, Box<dyn std::error::Error>> {
     if !git(worktree, &["status", "--porcelain"])?.trim().is_empty() {
         git(worktree, &["add", "-A"])?;
-        git(worktree, &["commit", "-m", &format!("{title}\n\nRefs #{number}")])?;
+        git(worktree, &["commit", "-m", &format!("{title}\n\nCloses #{number}")])?;
     }
     git(worktree, &["push", "-u", "origin", branch])?;
-    let body = format!("Refs #{number}\n\n{summary}");
+    let body = format!("Closes #{number}\n\n{summary}");
     let out = Command::new("gh")
         .args([
             "pr", "create", "--draft", "--repo", REPO, "--head", branch, "--title", title,
@@ -168,6 +168,46 @@ fn entry(iter: u32, issue: &str, model: &str, verdict: &str, pr: &str, summary: 
     )
 }
 
+/// Post-iteration self-review: deterministic checks, ledger, and escalation of
+/// recurring classes. Returns report lines to append under the iteration entry.
+fn self_review(dir: &Path, line: &str, verdict: &str, pr: &str, r: &Reviewed, issue: Option<u64>) -> String {
+    use crate::review::{self, LedgerEntry};
+    let n = issue.unwrap_or(0);
+    let findings = review::check(&review::Artifacts {
+        issue_body: &r.issue_body,
+        final_message: &r.final_message,
+        pr_body: &r.pr_body,
+        commit_message: &r.commit_message,
+        run_log: &r.run_log,
+        report_line: line,
+        verdict,
+        pushed: !pr.is_empty() && pr != "-",
+        issue_number: n,
+    });
+    if findings.is_empty() {
+        return String::new();
+    }
+    let mut out = review::render(&findings);
+    let path = dir.join("review-ledger.jsonl");
+    let new: Vec<LedgerEntry> = findings
+        .iter()
+        .map(|f| LedgerEntry { class: f.class.clone(), issue: n, evidence: f.evidence.clone(), escalated: false })
+        .collect();
+    let mut marks = Vec::new();
+    for (class, entries) in review::to_escalate(&review::read_ledger(&path), &new) {
+        let (title, body) = review::escalation_issue(&class, &entries);
+        match crate::propose::create_issue(&title, &body) {
+            Ok(url) => {
+                out.push_str(&format!("  - escalated recurring class `{class}`: {url}\n"));
+                marks.push(LedgerEntry { class, issue: 0, evidence: url, escalated: true });
+            }
+            Err(e) => out.push_str(&format!("  - escalation of `{class}` failed: {}\n", one_line(&e.to_string()))),
+        }
+    }
+    let _ = review::append_ledger(&path, &[new, marks].concat());
+    out
+}
+
 fn report(path: &Path, text: &str) {
     print!("{text}");
     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
@@ -175,11 +215,21 @@ fn report(path: &Path, text: &str) {
     }
 }
 
-/// One iteration's work; returns (issue label, verdict, pr, summary).
+/// What the self-review needs from one passing iteration.
+struct Reviewed {
+    model: String,
+    issue_body: String,
+    final_message: String,
+    pr_body: String,
+    commit_message: String,
+    run_log: String,
+}
+
+/// One iteration's work; returns (issue label, verdict, pr, summary, review input).
 async fn do_iteration(
     action: &Action,
     attempted: &mut Vec<u64>,
-) -> Result<(String, String, String, String), (String, Box<dyn std::error::Error>)> {
+) -> Result<(String, String, String, String, Option<Reviewed>), (String, Box<dyn std::error::Error>)> {
     let number = match action {
         Action::Run(n) => *n,
         _ => {
@@ -193,8 +243,9 @@ async fn do_iteration(
     let o = run_number(number).await.map_err(|e| (label.clone(), e))?;
     let summary = one_line(o.final_message.as_deref().unwrap_or(""));
     if !o.tests_ok {
-        return Ok((format!("#{number} {}", o.title), "FAIL (tests failing)".into(), "-".into(), summary));
+        return Ok((format!("#{number} {}", o.title), "FAIL (tests failing)".into(), "-".into(), summary, None));
     }
+    let final_message = o.final_message.clone().unwrap_or_default();
     let body = format!(
         "{}\n\nIssue: {}\nRun log: `{}`\nTests: PASS",
         o.final_message.as_deref().unwrap_or("(no final message)"),
@@ -203,7 +254,16 @@ async fn do_iteration(
     );
     let pr = push_and_open_draft_pr(&o.worktree, &o.branch, number, &o.title, &body)
         .map_err(|e| (label, e))?;
-    Ok((format!("#{number} {}", o.title), "PASS".into(), pr, summary))
+    let run_log = std::fs::read_to_string(&o.log_path).unwrap_or_default();
+    let reviewed = Reviewed {
+        model: crate::review::logged_model(&run_log).unwrap_or_else(|| "default".into()),
+        issue_body: o.issue_body.clone(),
+        final_message,
+        pr_body: format!("Closes #{number}\n\n{body}"),
+        commit_message: format!("{}\n\nCloses #{number}", o.title),
+        run_log,
+    };
+    Ok((format!("#{number} {}", o.title), "PASS".into(), pr, summary, Some(reviewed)))
 }
 
 pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -236,13 +296,18 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         history.iterations += 1;
         let model = "default";
         let line = match do_iteration(&action, &mut history.attempted).await {
-            Ok((issue, verdict, pr, summary)) => {
+            Ok((issue, verdict, pr, summary, reviewed)) => {
                 if verdict == "PASS" {
                     history.consecutive_failures = 0;
                 } else {
                     history.consecutive_failures += 1;
                 }
-                entry(history.iterations, &issue, model, &verdict, &pr, &summary)
+                let model = reviewed.as_ref().map_or(model, |r| r.model.as_str());
+                let mut line = entry(history.iterations, &issue, model, &verdict, &pr, &summary);
+                if let Some(r) = &reviewed {
+                    line.push_str(&self_review(&dir, &line, &verdict, &pr, r, history.attempted.last().copied()));
+                }
+                line
             }
             Err((issue, e)) => {
                 history.consecutive_failures += 1;

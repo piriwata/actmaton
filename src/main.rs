@@ -15,6 +15,7 @@ mod audit;
 mod loop_cmd;
 mod model;
 mod propose;
+mod review;
 mod run_loop;
 
 #[tokio::main]

@@ -219,6 +219,17 @@
   <code>actmaton-runs/loop-*.md</code> に追記され、標準出力にも表示されます。
   進捗はこのレポートとドラフト PR を見れば追えます。
 </p>
+
+<h3>自己レビュー</h3>
+<p>
+  各イテレーションの後、loop は自分の成果物を自分で検査します。まずコードによる決定的チェックで、
+  PR 本文の状態表記（「uncommitted」など）と git の実態、レポートのモデル欄と実行ログの解決済みモデル、
+  <code>Closes #n</code> の有無、完了条件ごとの状態行の有無、未確認条件があるのに PASS になっていないかを照合します。
+  不一致は証拠付きの finding としてレポートに追記され、<code>actmaton-runs/review-ledger.jsonl</code> に記録されます。
+  同じ種類の finding が2つの Issue で見つかると、自動で Issue が起票されます。
+  チェックリストは <code>docs/review-checklist.md</code> にあり、過去の実際の失敗（<code>src/review.rs</code> のテスト用 fixture）を根拠にした項目だけが入ります。
+  別モデル系列のレビュアー用プロンプトと、証拠のない finding を捨てるパーサも <code>src/review.rs</code> にありますが、レビュアーのセッション呼び出しはまだ loop に接続されていません。
+</p>
 <div class="note">
   ループが作る PR は<strong>ドラフト</strong>です。マージは常に行いません。マージは人の判断です。
 </div>
