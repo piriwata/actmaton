@@ -133,7 +133,7 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
     let (mut final_message, mut model) = run_session(issue, build_prompt(issue), &worktree, &log).await?;
 
     // Post-session verification, run by us (not the agent).
-    log_line(&log, "running cargo test in worktree".to_string());
+    log_line(&log, format!("running cargo test in worktree (build settings: {})", build_settings_text()));
     let (mut tests_ok, mut test_tail) = cargo_test(&worktree);
     let mut attempts = 0;
     while let RepairStep::Repair(attempt) = repair_decision(tests_ok, attempts) {
@@ -984,8 +984,24 @@ fn build_repair_prompt(issue: &Issue, attempt: u32, test_output: &str) -> String
     )
 }
 
+/// Memory-bounded build defaults for our own verification commands; an
+/// already-set environment value wins, so a roomy host can opt back in.
+const BUILD_ENV_DEFAULTS: [(&str, &str); 2] =
+    [("CARGO_BUILD_JOBS", "1"), ("CARGO_PROFILE_DEV_DEBUG", "0")];
+
+fn build_settings() -> Vec<(&'static str, String)> {
+    BUILD_ENV_DEFAULTS
+        .iter()
+        .map(|(k, v)| (*k, std::env::var(k).unwrap_or_else(|_| v.to_string())))
+        .collect()
+}
+
+fn build_settings_text() -> String {
+    build_settings().iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
+}
+
 fn cargo_test(dir: &Path) -> (bool, String) {
-    match Command::new("cargo").arg("test").current_dir(dir).output() {
+    match Command::new("cargo").arg("test").envs(build_settings()).current_dir(dir).output() {
         Ok(out) => {
             let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
             text.push_str(&String::from_utf8_lossy(&out.stdout));
