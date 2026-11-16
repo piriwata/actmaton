@@ -208,6 +208,20 @@ pub(crate) struct RepairOutcome {
     pub summary: String,
 }
 
+/// Path of the worktree that currently has `branch` checked out, if any.
+fn worktree_for_branch(root: &Path, branch: &str) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let want = format!("branch refs/heads/{branch}");
+    let mut path = None;
+    for line in git(root, &["worktree", "list", "--porcelain"])?.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(p));
+        } else if line == want {
+            return Ok(path);
+        }
+    }
+    Ok(None)
+}
+
 fn unmerged_files(worktree: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(git(worktree, &["diff", "--name-only", "--diff-filter=U"])?
         .lines()
@@ -248,11 +262,17 @@ pub(crate) async fn repair_conflict(
     base: &str,
 ) -> Result<RepairOutcome, Box<dyn std::error::Error>> {
     let root = repo_root()?;
-    let dir_name = branch.rsplit('/').next().unwrap_or(branch);
-    let worktree = root.parent().ok_or("repo root has no parent directory")?.join(dir_name);
     let remote = format!("origin/{branch}");
     git(&root, &["fetch", "origin"])?;
-    if worktree.exists() {
+    let existing = worktree_for_branch(&root, branch)?;
+    let worktree = match &existing {
+        Some(p) => p.clone(),
+        None => {
+            let dir_name = branch.replace('/', "-");
+            root.parent().ok_or("repo root has no parent directory")?.join(dir_name)
+        }
+    };
+    if existing.is_some() {
         if !git(&worktree, &["status", "--porcelain"])?.is_empty() {
             return Err(format!("worktree {} has uncommitted changes; not touching it", worktree.display()).into());
         }
@@ -997,6 +1017,34 @@ fn cargo_test(dir: &Path) -> (bool, String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finds_leftover_worktree_for_branch() {
+        use std::process::Command;
+        let base = std::env::temp_dir().join(format!("actmaton-wt-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let leftover = base.join("actmaton-issue-48");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run(&repo, &["worktree", "add", "-q", "-b", "actmaton/issue-48", leftover.to_str().unwrap()]);
+
+        let found = super::worktree_for_branch(&repo, "actmaton/issue-48").unwrap();
+        assert_eq!(found.map(|p| p.canonicalize().unwrap()), Some(leftover.canonicalize().unwrap()));
+        assert_eq!(super::worktree_for_branch(&repo, "actmaton/issue-50").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn detects_conflict_markers() {
         assert!(super::has_conflict_markers("a\n<<<<<<< HEAD\nx\n"));
