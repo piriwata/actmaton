@@ -109,6 +109,7 @@ pub(crate) struct Outcome {
     pub worktree: PathBuf,
     pub tests_ok: bool,
     pub final_message: Option<String>,
+    pub model: Option<String>,
     pub log_path: PathBuf,
 }
 
@@ -130,10 +131,10 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
     println!("worktree: {}", worktree.display());
     log_line(&log, format!("worktree created: {} (branch {branch})", worktree.display()));
 
-    let mut final_message = run_session(issue, build_prompt(issue), &worktree, &log).await?;
+    let (mut final_message, mut model) = run_session(issue, build_prompt(issue), &worktree, &log).await?;
 
     // Post-session verification, run by us (not the agent).
-    log_line(&log, "running cargo test in worktree".to_string());
+    log_line(&log, format!("running cargo test in worktree (build settings: {})", build_settings_text()));
     let (mut tests_ok, mut test_tail) = cargo_test(&worktree);
     let mut attempts = 0;
     while let RepairStep::Repair(attempt) = repair_decision(tests_ok, attempts) {
@@ -141,8 +142,11 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
         println!("cargo test failed; repair attempt {attempt}/{MAX_REPAIR_ATTEMPTS}");
         log_line(&log, format!("repair attempt {attempt}/{MAX_REPAIR_ATTEMPTS}: starting follow-up session"));
         let prompt = build_repair_prompt(issue, attempt, &test_tail);
-        let reply = run_session(issue, prompt, &worktree, &log).await?;
+        let (reply, reply_model) = run_session(issue, prompt, &worktree, &log).await?;
         let summary = one_line_summary(reply.as_deref());
+        if reply_model.is_some() {
+            model = reply_model;
+        }
         if reply.is_some() {
             final_message = reply;
         }
@@ -193,8 +197,138 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
         worktree,
         tests_ok,
         final_message,
+        model,
         log_path,
     })
+}
+
+/// Result of one conflict-repair attempt on a PR branch.
+pub(crate) struct RepairOutcome {
+    pub files: Vec<String>,
+    pub tests_ok: bool,
+    pub pushed: bool,
+    pub summary: String,
+}
+
+/// Path of the worktree that currently has `branch` checked out, if any.
+fn worktree_for_branch(root: &Path, branch: &str) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let want = format!("branch refs/heads/{branch}");
+    let mut path = None;
+    for line in git(root, &["worktree", "list", "--porcelain"])?.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(p));
+        } else if line == want {
+            return Ok(path);
+        }
+    }
+    Ok(None)
+}
+
+fn unmerged_files(worktree: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(git(worktree, &["diff", "--name-only", "--diff-filter=U"])?
+        .lines()
+        .map(String::from)
+        .collect())
+}
+
+fn has_conflict_markers(text: &str) -> bool {
+    text.lines().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> "))
+}
+
+fn build_conflict_prompt(pr: u64, branch: &str, base: &str, files: &[String]) -> String {
+    format!(
+        "You are repairing merge conflicts on the branch `{branch}` of PR #{pr} in its own git \
+         worktree (your working directory). `origin/{base}` has already been merged into the \
+         branch and stopped with conflicts in:\n{list}\n\n\
+         Resolve each conflict preserving the intent of BOTH sides: keep the PR's own changes and \
+         incorporate what {base} changed. Never resolve by discarding the PR's changes wholesale; \
+         if {base}'s version should simply win for a file, say why in your summary. If both sides \
+         rewrote the same logic and the resolution is not mechanical, do not guess: leave the \
+         conflict markers in place and explain in your final message.\n\n\
+         Rules: edit files only with the write/edit tools (never via shell); stay inside the \
+         worktree; no git push, no gh, no force operations, do not touch main. When a file is \
+         fully resolved run `git add <path>` for it, then run `cargo test` and make sure it passes. \
+         The orchestrator concludes the merge commit and pushes. Your final message must list, \
+         per conflicted file, how it was resolved.",
+        list = files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"),
+    )
+}
+
+/// Merge `origin/<base>` into the PR's own branch, have a session resolve
+/// conflicts, verify with `cargo test`, then conclude the merge and push to
+/// the same branch (never forced). On any failure the merge attempt is
+/// discarded so the branch is left as it was.
+pub(crate) async fn repair_conflict(
+    pr: u64,
+    branch: &str,
+    base: &str,
+) -> Result<RepairOutcome, Box<dyn std::error::Error>> {
+    let root = repo_root()?;
+    let remote = format!("origin/{branch}");
+    git(&root, &["fetch", "origin"])?;
+    let existing = worktree_for_branch(&root, branch)?;
+    let worktree = match &existing {
+        Some(p) => p.clone(),
+        None => {
+            let dir_name = branch.replace('/', "-");
+            root.parent().ok_or("repo root has no parent directory")?.join(dir_name)
+        }
+    };
+    if existing.is_some() {
+        if !git(&worktree, &["status", "--porcelain"])?.is_empty() {
+            return Err(format!("worktree {} has uncommitted changes; not touching it", worktree.display()).into());
+        }
+        if git(&worktree, &["merge-base", "--is-ancestor", &remote, "HEAD"]).is_err() {
+            return Err(format!("local {branch} is behind/diverged from {remote}; not touching it").into());
+        }
+    } else {
+        let wt = worktree.to_str().ok_or("worktree path is not UTF-8")?;
+        git(&root, &["worktree", "add", "-B", branch, wt, &remote])?;
+    }
+
+    let before = git(&worktree, &["rev-parse", "HEAD"])?;
+    let _ = git(&worktree, &["merge", "--no-edit", &format!("origin/{base}")]);
+    let files = unmerged_files(&worktree)?;
+    let fail = |msg: String, files: Vec<String>| {
+        let _ = git(&worktree, &["reset", "--hard", &before]);
+        Ok(RepairOutcome { files, tests_ok: false, pushed: false, summary: msg })
+    };
+
+    let mut summary = String::from("merged cleanly, no textual conflicts");
+    if !files.is_empty() {
+        let issue = Issue {
+            number: pr,
+            title: format!("conflict repair for PR #{pr}"),
+            body: String::new(),
+            url: String::new(),
+            comments: Vec::new(),
+        };
+        let log: RunLog = Arc::new(Mutex::new(Vec::new()));
+        let (reply, _) =
+            run_session(&issue, build_conflict_prompt(pr, branch, base, &files), &worktree, &log).await?;
+        summary = reply.unwrap_or_else(|| "(no final message)".into());
+        // Sessions often resolve on disk but leave the index at UU: stage those.
+        for f in unmerged_files(&worktree)? {
+            let text = std::fs::read_to_string(worktree.join(&f)).unwrap_or_default();
+            if has_conflict_markers(&text) {
+                return fail(format!("non-mechanical conflict left in {f}; {summary}"), files);
+            }
+            git(&worktree, &["add", "--", &f])?;
+        }
+    }
+    let (tests_ok, tail) = cargo_test(&worktree);
+    if !tests_ok {
+        return fail(format!("cargo test failed after merge:\n{tail}"), files);
+    }
+    if git(&worktree, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok() {
+        git(&worktree, &["add", "-A"])?;
+        git(&worktree, &["commit", "--no-edit"])?;
+    }
+    if git(&worktree, &["rev-parse", "HEAD"])? == before {
+        return Ok(RepairOutcome { files, tests_ok, pushed: false, summary: "nothing to merge".into() });
+    }
+    git(&worktree, &["push", "origin", branch])?;
+    Ok(RepairOutcome { files, tests_ok, pushed: true, summary })
 }
 
 /// Accept `3`, `#3`, or a full issue URL (`.../issues/3`).
@@ -462,7 +596,7 @@ async fn run_session(
     prompt: String,
     worktree: &Path,
     log: &RunLog,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error>> {
     let root = worktree
         .canonicalize()
         .unwrap_or_else(|_| worktree.to_path_buf());
@@ -532,7 +666,7 @@ async fn run_session(
         attempt.resolved_model.as_deref().unwrap_or("(not reported)")
     );
     log_line(log, "session finished".to_string());
-    Ok(attempt.value)
+    Ok((attempt.value, attempt.resolved_model))
 }
 
 // ---------------------------------------------------------------------------
@@ -872,8 +1006,24 @@ fn build_repair_prompt(issue: &Issue, attempt: u32, test_output: &str) -> String
     )
 }
 
+/// Memory-bounded build defaults for our own verification commands; an
+/// already-set environment value wins, so a roomy host can opt back in.
+const BUILD_ENV_DEFAULTS: [(&str, &str); 2] =
+    [("CARGO_BUILD_JOBS", "1"), ("CARGO_PROFILE_DEV_DEBUG", "0")];
+
+fn build_settings() -> Vec<(&'static str, String)> {
+    BUILD_ENV_DEFAULTS
+        .iter()
+        .map(|(k, v)| (*k, std::env::var(k).unwrap_or_else(|_| v.to_string())))
+        .collect()
+}
+
+fn build_settings_text() -> String {
+    build_settings().iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
+}
+
 fn cargo_test(dir: &Path) -> (bool, String) {
-    match Command::new("cargo").arg("test").current_dir(dir).output() {
+    match Command::new("cargo").arg("test").envs(build_settings()).current_dir(dir).output() {
         Ok(out) => {
             let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
             text.push_str(&String::from_utf8_lossy(&out.stdout));
@@ -885,6 +1035,40 @@ fn cargo_test(dir: &Path) -> (bool, String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finds_leftover_worktree_for_branch() {
+        use std::process::Command;
+        let base = std::env::temp_dir().join(format!("actmaton-wt-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let leftover = base.join("actmaton-issue-48");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run(&repo, &["worktree", "add", "-q", "-b", "actmaton/issue-48", leftover.to_str().unwrap()]);
+
+        let found = super::worktree_for_branch(&repo, "actmaton/issue-48").unwrap();
+        assert_eq!(found.map(|p| p.canonicalize().unwrap()), Some(leftover.canonicalize().unwrap()));
+        assert_eq!(super::worktree_for_branch(&repo, "actmaton/issue-50").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn detects_conflict_markers() {
+        assert!(super::has_conflict_markers("a\n<<<<<<< HEAD\nx\n"));
+        assert!(!super::has_conflict_markers("Title\n=======\nfine\n"));
+    }
+
     use super::*;
 
     #[test]
