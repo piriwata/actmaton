@@ -20,6 +20,12 @@ GitHub Issues, PRs, and CI hold the backlog, decisions, and results. The initial
 
 `actmaton loop` records one verdict per iteration: **FAIL** when `cargo test` fails; **PASS** when tests pass and every item under the issue's "Done criteria"/"Acceptance" section is reported `VERIFIED` by the session (also when the issue states none); otherwise **PARTIAL**. The session must end with one `CRITERION <n>: VERIFIED|NOT-VERIFIED|HUMAN-CHECK - <how/why>` line per criterion; unaddressed criteria count as not verified. PARTIAL runs still open a draft PR, with the unverified criteria (marked `human-check` where not machine-checkable) listed in the loop report and PR body.
 
+### Loop resource notes
+
+Memory, not CPU, is the binding constraint on small hosts (an 8 GB VM hit the OOM killer twice in unattended runs). The loop's own `cargo test` verification therefore runs with `CARGO_BUILD_JOBS=1` and `CARGO_PROFILE_DEV_DEBUG=0` by default, and the run log records the settings used. This trades wall time (slower builds) for lower peak memory. Set either variable in the environment to override it, e.g. `CARGO_BUILD_JOBS=8` on a roomy machine.
+
+Measured limit: the single `rustc` compiling `github-copilot-sdk` peaks at about 5.1 GB RSS regardless of these settings. Disabling the SDK's default features (`default-features = false`) only lowered it to about 4.3 GB, so it was not adopted. To avoid paying that peak repeatedly, share one `CARGO_TARGET_DIR` across worktrees.
+
 ## Roadmap
 
 - [x] **M0 — Seed:** the minimal agent loop, built from outside Actmaton: read one Issue, edit in a worktree, test, open a draft PR.

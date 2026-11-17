@@ -85,6 +85,95 @@ pub fn plan(board: &[BoardIssue], history: &History, limits: &Limits, elapsed: D
     }
 }
 
+const BRANCH_PREFIX: &str = "actmaton/issue-";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenPr {
+    pub number: u64,
+    pub branch: String,
+    pub base: String,
+    pub mergeable: String,
+}
+
+/// Open PRs eligible for conflict repair: actmaton's own branches only,
+/// conflicting only, and not already attempted in this invocation.
+pub fn repair_candidates<'a>(prs: &'a [OpenPr], repaired: &[u64]) -> Vec<&'a OpenPr> {
+    prs.iter()
+        .filter(|p| p.branch.starts_with(BRANCH_PREFIX))
+        .filter(|p| p.mergeable == "CONFLICTING")
+        .filter(|p| !repaired.contains(&p.number))
+        .collect()
+}
+
+fn fetch_open_prs() -> Result<Vec<OpenPr>, Box<dyn std::error::Error>> {
+    let out = Command::new("gh")
+        .args([
+            "pr", "list", "--repo", REPO, "--state", "open", "--limit", "100", "--json",
+            "number,headRefName,baseRefName,mergeable",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("gh pr list failed: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)?;
+    Ok(v.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|p| OpenPr {
+                    number: p["number"].as_u64().unwrap_or(0),
+                    branch: p["headRefName"].as_str().unwrap_or_default().to_string(),
+                    base: p["baseRefName"].as_str().unwrap_or("main").to_string(),
+                    mergeable: p["mergeable"].as_str().unwrap_or_default().to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Repair each eligible conflicting PR once, comment on it, and return report lines.
+async fn maintain(report_path: &Path, repaired: &mut Vec<u64>) {
+    let prs = match fetch_open_prs() {
+        Ok(p) => p,
+        Err(e) => {
+            report(report_path, &format!("- maintenance: could not list PRs: {}\n", one_line(&e.to_string())));
+            return;
+        }
+    };
+    let todo: Vec<OpenPr> = repair_candidates(&prs, repaired).into_iter().cloned().collect();
+    for pr in todo {
+        repaired.push(pr.number);
+        let (line, comment) = match crate::run_loop::repair_conflict(pr.number, &pr.branch, &pr.base).await {
+            Ok(o) => {
+                let files = if o.files.is_empty() { "(none)".to_string() } else { o.files.join(", ") };
+                let verdict = match (o.tests_ok, o.pushed) {
+                    (true, true) => "REPAIRED (tests PASS, pushed)",
+                    (true, false) => "no change needed",
+                    _ => "!!! REPAIR FAILED — needs attention (nothing pushed)",
+                };
+                let comment = format!(
+                    "actmaton conflict repair against `{}`\n\nConflict files: {files}\nTests: {}\nPushed: {}\n\nResolution:\n{}",
+                    pr.base,
+                    if o.tests_ok { "PASS" } else { "FAIL" },
+                    o.pushed,
+                    o.summary
+                );
+                (
+                    format!("- maintenance: PR #{} | conflicts: {files} | {verdict} | {}\n", pr.number, one_line(&o.summary)),
+                    comment,
+                )
+            }
+            Err(e) => (
+                format!("- maintenance: PR #{} | !!! REPAIR ERROR — needs attention | {}\n", pr.number, one_line(&e.to_string())),
+                format!("actmaton conflict repair could not run: {e}"),
+            ),
+        };
+        report(report_path, &line);
+        let _ = Command::new("gh")
+            .args(["pr", "comment", &pr.number.to_string(), "--repo", REPO, "--body", &comment])
+            .output();
+    }
+}
+
 fn parse_args(args: &[String]) -> Result<Limits, String> {
     let mut l = Limits::default();
     let mut it = args.iter();
@@ -148,7 +237,7 @@ fn push_and_open_draft_pr(
         git(worktree, &["commit", "-m", &format!("{title}\n\nRefs #{number}")])?;
     }
     git(worktree, &["push", "-u", "origin", branch])?;
-    let body = format!("Refs #{number}\n\n{summary}");
+    let body = format!("Closes #{number}\n\n{summary}");
     let out = Command::new("gh")
         .args([
             "pr", "create", "--draft", "--repo", REPO, "--head", branch, "--title", title,
@@ -164,7 +253,40 @@ fn push_and_open_draft_pr(
 
 fn one_line(s: &str) -> String {
     let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("(no summary)");
-    line.chars().take(200).collect()
+    truncate_at_word(line, 200)
+}
+
+/// Cut `s` to at most `max` chars at a word boundary, adding an ellipsis.
+fn truncate_at_word(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    let boundary_ok = s.chars().nth(max).is_some_and(char::is_whitespace);
+    let cut = if boundary_ok { cut.as_str() } else { cut.rsplit_once(char::is_whitespace).map_or(cut.as_str(), |(h, _)| h) };
+    format!("{}…", cut.trim_end_matches(|c: char| c.is_whitespace() || ",;:-".contains(c)))
+}
+
+/// Drop session-local status lines (uncommitted / will push / next steps)
+/// that orchestration makes false once the loop commits and opens the PR.
+fn sanitize_pr_body(s: &str) -> String {
+    const STALE: [&str; 7] = [
+        "uncommitted",
+        "not committed",
+        "nothing is committed",
+        "not been committed",
+        "will push",
+        "next step",
+        "left for you",
+    ];
+    let kept: Vec<&str> = s
+        .lines()
+        .filter(|l| {
+            let l = l.to_lowercase();
+            !STALE.iter().any(|p| l.contains(p))
+        })
+        .collect();
+    kept.join("\n").trim().to_string()
 }
 
 fn entry(iter: u32, issue: &str, model: &str, verdict: &str, pr: &str, summary: &str) -> String {
@@ -180,11 +302,11 @@ fn report(path: &Path, text: &str) {
     }
 }
 
-/// One iteration's work; returns (issue label, verdict, pr, summary).
+/// One iteration's work; returns (issue label, model, verdict, pr, summary).
 async fn do_iteration(
     action: &Action,
     attempted: &mut Vec<u64>,
-) -> Result<(String, String, String, String), (String, Box<dyn std::error::Error>)> {
+) -> Result<(String, String, String, String, String), (String, Box<dyn std::error::Error>)> {
     let number = match action {
         Action::Run(n) => *n,
         _ => {
@@ -197,9 +319,10 @@ async fn do_iteration(
     let label = format!("#{number}");
     let o = run_number(number).await.map_err(|e| (label.clone(), e))?;
     let summary = one_line(o.final_message.as_deref().unwrap_or(""));
+    let model = o.model.clone().unwrap_or_else(|| "(not reported)".into());
     let verdict = decide_verdict(o.tests_ok, &o.criteria, o.final_message.as_deref());
     if verdict == Verdict::Fail {
-        return Ok((format!("#{number} {}", o.title), "FAIL (tests failing)".into(), "-".into(), summary));
+        return Ok((format!("#{number} {}", o.title), model, "FAIL (tests failing)".into(), "-".into(), summary));
     }
     let unverified = match &verdict {
         Verdict::Partial(_) => format!("\nVerdict: PARTIAL. Unverified criteria:\n{}", verdict.unverified_text()),
@@ -207,7 +330,7 @@ async fn do_iteration(
     };
     let body = format!(
         "{}\n\nIssue: {}\nRun log: `{}`\nTests: PASS{unverified}",
-        o.final_message.as_deref().unwrap_or("(no final message)"),
+        sanitize_pr_body(o.final_message.as_deref().unwrap_or("(no final message)")),
         o.url,
         o.log_path.display()
     );
@@ -217,7 +340,7 @@ async fn do_iteration(
         Verdict::Partial(_) => format!("{summary} | unverified: {}", verdict.unverified_text().replace('\n', " ")),
         _ => summary,
     };
-    Ok((format!("#{number} {}", o.title), verdict.label().into(), pr, summary))
+    Ok((format!("#{number} {}", o.title), model, verdict.label().into(), pr, summary))
 }
 
 pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -240,7 +363,9 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
 
     let start = Instant::now();
     let mut history = History::default();
+    let mut repaired: Vec<u64> = Vec::new();
     loop {
+        maintain(&path, &mut repaired).await;
         let board = fetch_board()?;
         let action = plan(&board, &history, &limits, start.elapsed());
         if let Action::Stop(reason) = &action {
@@ -248,19 +373,18 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             break;
         }
         history.iterations += 1;
-        let model = "default";
         let line = match do_iteration(&action, &mut history.attempted).await {
-            Ok((issue, verdict, pr, summary)) => {
+            Ok((issue, model, verdict, pr, summary)) => {
                 if !verdict.starts_with("FAIL") {
                     history.consecutive_failures = 0;
                 } else {
                     history.consecutive_failures += 1;
                 }
-                entry(history.iterations, &issue, model, &verdict, &pr, &summary)
+                entry(history.iterations, &issue, &model, &verdict, &pr, &summary)
             }
             Err((issue, e)) => {
                 history.consecutive_failures += 1;
-                entry(history.iterations, &issue, model, "ERROR", "-", &one_line(&e.to_string()))
+                entry(history.iterations, &issue, "(not run)", "ERROR", "-", &one_line(&e.to_string()))
             }
         };
         report(&path, &line);
@@ -283,6 +407,26 @@ mod tests {
 
     fn lim() -> Limits {
         Limits { max_iterations: 3, max_failures: 2, budget: Duration::from_secs(100) }
+    }
+
+    #[test]
+    fn repair_candidates_filter() {
+        let pr = |n, b: &str, m: &str| OpenPr {
+            number: n,
+            branch: b.into(),
+            base: "main".into(),
+            mergeable: m.into(),
+        };
+        let prs = vec![
+            pr(1, "actmaton/issue-1", "CONFLICTING"),
+            pr(2, "actmaton/issue-2", "MERGEABLE"),
+            pr(3, "someone/feature", "CONFLICTING"),
+            pr(4, "actmaton/issue-4", "CONFLICTING"),
+            pr(5, "actmaton/issue-5", "UNKNOWN"),
+        ];
+        let nums = |r: Vec<&OpenPr>| r.iter().map(|p| p.number).collect::<Vec<_>>();
+        assert_eq!(nums(repair_candidates(&prs, &[])), vec![1, 4]);
+        assert_eq!(nums(repair_candidates(&prs, &[1])), vec![4]);
     }
 
     #[test]
@@ -315,6 +459,17 @@ mod tests {
         assert!(matches!(plan(&board, &h, &lim(), Duration::ZERO), Action::Stop(r) if r.contains("failures")));
         let h = History::default();
         assert!(matches!(plan(&board, &h, &lim(), Duration::from_secs(100)), Action::Stop(r) if r.contains("budget")));
+    }
+
+    #[test]
+    fn sanitizes_pr_body_and_truncates_cleanly() {
+        let body = "Done.\nNothing is committed.\nChanged x.\nLeft uncommitted in worktree.";
+        assert_eq!(sanitize_pr_body(body), "Done.\nChanged x.");
+        assert_eq!(truncate_at_word("short one", 200), "short one");
+        let long = "word ".repeat(100);
+        let t = truncate_at_word(&long, 22);
+        assert_eq!(t, "word word word word…");
+        assert!(one_line(&long).ends_with("word…"));
     }
 
     #[test]
