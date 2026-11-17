@@ -437,7 +437,7 @@ fn extract_findings(reply: &str) -> Result<Vec<audit::Finding>, Box<dyn std::err
 }
 
 
-fn create_issue(title: &str, body: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn create_issue(title: &str, body: &str) -> Result<String, Box<dyn std::error::Error>> {
     command_output(
         Command::new("gh").args([
             "issue", "create", "--repo", REPO, "--title", title, "--body", body, "--label",

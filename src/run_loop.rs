@@ -103,6 +103,7 @@ pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::erro
 /// Result of one full run of an issue (worktree, session, verification).
 pub(crate) struct Outcome {
     pub title: String,
+    pub issue_body: String,
     pub url: String,
     pub branch: String,
     pub worktree: PathBuf,
@@ -191,6 +192,7 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
 
     Ok(Outcome {
         title: issue.title.clone(),
+        issue_body: issue.body.clone(),
         url: issue.url.clone(),
         branch,
         worktree,

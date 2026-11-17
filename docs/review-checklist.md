@@ -1,0 +1,14 @@
+# Self-review checklist
+
+Used by the post-iteration self-review (deterministic checks in `src/review.rs`
+and the skeptical reviewer prompt). Each class must cite a real past failure;
+new classes enter only with repo-internal evidence (no speculative rules), and
+their failure is added as a fixture test in `src/review.rs`.
+
+- `stale-status-wording` — PR body says changes are "uncommitted" though the branch was committed and pushed (loop run 1).
+- `report-run-log-mismatch` — loop report says `model: default` while the run log has a resolved model (loop run 1).
+- `closing-keyword` — PR/commit uses `Refs #n` instead of `Closes #n`, so merge does not close the issue (loop run 1).
+- `missing-criterion-status` — the final message lacks a per-criterion status line for every stated done criterion; the verdict should be PARTIAL (#48).
+- `unchecked-criterion-passed` — the final message admits an unchecked criterion but the verdict is PASS (loop run 1, #48).
+
+Every finding must cite evidence (a quoted line, file:line, or log line). No evidence, no finding.
