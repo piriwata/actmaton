@@ -450,17 +450,30 @@ fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path: &Pat
     items.retain(|i| !dev.items.iter().any(|n| n.pr == i.pr));
     items.extend(dev.items.iter().cloned());
     git(root, &["fetch", "origin", "main", "dev"])?;
-    let ahead = git(root, &["log", "origin/main..origin/dev", "--format=%s"])?;
-    items.retain(|i| ahead.contains(&format!("#{} ", i.pr)));
+    let iterations = items.len() as u32;
+    let human_touches = items.iter().filter(|i| i.human).count() as u32;
+    let ahead = git(root, &["log", "origin/main..origin/dev", "--format=%H %s"])?;
+    let shipped: Vec<crate::devflow::Item> = ahead
+        .lines()
+        .filter_map(|l| {
+            let (sha, subject) = l.split_once(' ')?;
+            let (pr, title) = crate::devflow::pr_from_subject(subject)?;
+            let files = git(root, &["diff", "--name-only", &format!("{sha}^1"), sha])
+                .map(|o| o.lines().map(String::from).collect())
+                .unwrap_or_default();
+            Some(crate::devflow::Item { pr, title, url: format!("https://github.com/{REPO}/pull/{pr}"), files, ..Default::default() })
+        })
+        .collect();
+    let items = crate::devflow::merge_shipped(items, shipped);
     std::fs::write(&store, serde_json::to_string(&items.iter().map(item_json).collect::<Vec<_>>())?)?;
 
     let yomi = std::env::var("ACTMATON_YOMIYASU_DIR").ok().filter(|d| Path::new(d).join("yomiyasu_check.py").exists());
     let mut m = Morning {
         remaining: dev.remaining.clone(),
-        dev_head: dev.dev_head.clone(),
+        dev_head: git(root, &["rev-parse", "--short", "origin/dev"]).unwrap_or_else(|_| dev.dev_head.clone()),
         dev_green: dev.dev_green,
-        iterations: items.len() as u32,
-        human_touches: items.iter().filter(|i| i.human).count() as u32,
+        iterations,
+        human_touches,
         items,
         yomiyasu_note: yomi.is_none().then(|| "yomiyasu を読み込めなかったため、この文章は文体ルールだけで書いています。".to_string()),
     };
