@@ -74,7 +74,7 @@ fn comments_section(comments: &[Comment]) -> String {
 }
 
 /// Entry point for `actmaton run <issue-number-or-url>`.
-pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(issue_ref: &str, dry_run: bool, base: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let number = parse_issue_ref(issue_ref)?;
     let repo_root = repo_root()?;
     println!("repo root: {}", repo_root.display());
@@ -90,7 +90,7 @@ pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::erro
         return Ok(());
     }
 
-    let outcome = execute(&issue, &repo_root).await?;
+    let outcome = execute(&issue, &repo_root, base).await?;
     println!("next step: review the worktree, then commit/push/open a PR manually.");
     println!("=============================================");
 
@@ -112,23 +112,24 @@ pub(crate) struct Outcome {
     pub model: Option<String>,
     pub log_path: PathBuf,
     pub criteria: Vec<String>,
+    pub repair_attempts: u32,
 }
 
 /// Run an issue by number: fetch it (fresh, so new comments are honored)
 /// and execute it.
-pub(crate) async fn run_number(number: u64) -> Result<Outcome, Box<dyn std::error::Error>> {
+pub(crate) async fn run_number(number: u64, base: Option<&str>) -> Result<Outcome, Box<dyn std::error::Error>> {
     let repo_root = repo_root()?;
     let issue = fetch_issue(number)?;
-    execute(&issue, &repo_root).await
+    execute(&issue, &repo_root, base).await
 }
 
-async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std::error::Error>> {
+async fn execute(issue: &Issue, repo_root: &Path, base: Option<&str>) -> Result<Outcome, Box<dyn std::error::Error>> {
     let number = issue.number;
     ensure_shared_target_dir(repo_root);
     let log: RunLog = Arc::new(Mutex::new(Vec::new()));
     log_line(&log, format!("issue #{}: {} ({})", issue.number, issue.title, issue.url));
 
-    let (branch, worktree) = setup_worktree(repo_root, number)?;
+    let (branch, worktree) = setup_worktree(repo_root, number, base)?;
     println!("branch:   {branch}");
     println!("worktree: {}", worktree.display());
     log_line(&log, format!("worktree created: {} (branch {branch})", worktree.display()));
@@ -208,6 +209,7 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
         model,
         log_path,
         criteria,
+        repair_attempts: attempts,
     })
 }
 
@@ -407,12 +409,21 @@ fn fetch_issue(number: u64) -> Result<Issue, Box<dyn std::error::Error>> {
 }
 
 /// Create branch `actmaton/issue-<n>` and a sibling worktree directory
-/// based on the clone's current HEAD. Fails if either already exists, so
+/// based on the clone's current HEAD (or `origin/<base>` when a base branch
+/// such as `dev` is given). Fails if either already exists, so
 /// a stale task is never silently reused.
 fn setup_worktree(
     repo_root: &Path,
     number: u64,
+    base: Option<&str>,
 ) -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
+    let start = match base {
+        Some(b) => {
+            git(repo_root, &["fetch", "origin", b])?;
+            format!("origin/{b}")
+        }
+        None => "HEAD".to_string(),
+    };
     let branch = format!("actmaton/issue-{number}");
     let worktree = repo_root
         .parent()
@@ -430,7 +441,7 @@ fn setup_worktree(
             false
         };
         let ahead: u64 = if branch_exists {
-            git(repo_root, &["rev-list", "--count", &format!("HEAD..{branch}")])?.parse()?
+            git(repo_root, &["rev-list", "--count", &format!("{start}..{branch}")])?.parse()?
         } else {
             0
         };
@@ -471,7 +482,7 @@ fn setup_worktree(
             "-b",
             &branch,
             worktree.to_str().ok_or("worktree path is not UTF-8")?,
-            "HEAD",
+            &start,
         ])
         .current_dir(repo_root)
         .output()?;
@@ -1048,7 +1059,7 @@ fn build_settings_text() -> String {
     build_settings().iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
 }
 
-fn cargo_test(dir: &Path) -> (bool, String) {
+pub(crate) fn cargo_test(dir: &Path) -> (bool, String) {
     match Command::new("cargo").arg("test").envs(build_settings()).current_dir(dir).output() {
         Ok(out) => {
             let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
