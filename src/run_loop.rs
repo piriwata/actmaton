@@ -1112,8 +1112,22 @@ impl Verdict {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Verdict::Pass => "PASS",
-            Verdict::Partial(_) => "PARTIAL",
+            Verdict::Partial(_) if self.human_only() => "PARTIAL-HUMAN-ONLY",
+            Verdict::Partial(_) => "PARTIAL-BLOCKED",
             Verdict::Fail => "FAIL",
+        }
+    }
+
+    /// Partial where every unverified criterion is a human-check (nothing NOT-VERIFIED).
+    pub(crate) fn human_only(&self) -> bool {
+        matches!(self, Verdict::Partial(u) if u.iter().all(|(_, human)| *human))
+    }
+
+    /// Outstanding human-check criteria, for the report and standing PR.
+    pub(crate) fn human_checks(&self) -> Vec<String> {
+        match self {
+            Verdict::Partial(u) if self.human_only() => u.iter().map(|(c, _)| c.clone()).collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -1242,6 +1256,11 @@ mod tests {
             decide_verdict(true, &c, Some(mixed)),
             Verdict::Partial(vec![("a".into(), false), ("b".into(), true)])
         );
+        assert_eq!(decide_verdict(true, &c, Some(mixed)).label(), "PARTIAL-BLOCKED");
+        let human = "CRITERION 1: VERIFIED\nCRITERION 2: HUMAN-CHECK - visual";
+        let v = decide_verdict(true, &c, Some(human));
+        assert_eq!(v.label(), "PARTIAL-HUMAN-ONLY");
+        assert_eq!(v.human_checks(), vec!["b".to_string()]);
         // unaddressed criterion is not verified
         assert_eq!(
             decide_verdict(true, &c, Some("CRITERION 1: VERIFIED")),
