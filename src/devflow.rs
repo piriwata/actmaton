@@ -159,6 +159,50 @@ fn render_item(i: &Item) -> String {
     s
 }
 
+pub const NIHONGO_NOTE: &str = "nihongo を読み込めなかったため、この文章は文体ルールだけで書いています。";
+
+/// Prompt for the drafting session: the nihongo skill text plus the
+/// deterministic body, whose facts must be kept as they are.
+pub fn nihongo_prompt(skill: &str, body: &str) -> String {
+    format!(
+        "以下の日本語文章スキル（nihongo）に従って、PR 本文の日本語だけを読みやすく直してください。\n\
+         事実は変えないでください。PR 番号、リンク、コミット、数値、テストの状態、見出し、項目は、追加も削除もしません。\n\
+         返答は直した本文だけにしてください（前置きやコードフェンスは付けません）。\n\n\
+         ## スキル\n{skill}\n\n## 本文\n{body}\n"
+    )
+}
+
+fn fact_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in text.split(|c: char| c.is_whitespace() || "()（）、。：,".contains(c)) {
+        if w.starts_with("https://") || (w.starts_with('#') && w.len() > 1 && w[1..].chars().all(|c| c.is_ascii_digit())) {
+            out.push(w.to_string());
+        }
+    }
+    for (i, span) in text.split('`').enumerate() {
+        if i % 2 == 1 && !span.is_empty() {
+            out.push(format!("`{span}`"));
+        }
+    }
+    out
+}
+
+/// Whether every link, PR number and code span of `original` survives in `refined`.
+pub fn facts_preserved(original: &str, refined: &str) -> bool {
+    fact_tokens(original).iter().all(|t| refined.contains(t.as_str()))
+}
+
+/// Strip a wrapping code fence the session may add around the body.
+pub fn unfence(reply: &str) -> &str {
+    let t = reply.trim();
+    t.strip_prefix("```markdown")
+        .or_else(|| t.strip_prefix("```md"))
+        .or_else(|| t.strip_prefix("```"))
+        .and_then(|r| r.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(t)
+}
+
 /// The standing dev → main PR body: plain Japanese, short sentences, bullets.
 pub fn build_body(m: &Morning) -> String {
     let mut s = String::from("# 朝のまとめ（dev → main）\n\n");
@@ -228,6 +272,17 @@ pub fn build_body(m: &Morning) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nihongo_refinement_must_keep_facts() {
+        let body = "- dev の最新: `abc123`\n### #12 t\n- リンク: https://github.com/o/r/pull/12\n";
+        assert!(nihongo_prompt("SKILL", body).contains("SKILL"));
+        let ok = "- dev の最新は `abc123` です。\n### #12 t\n- リンク: https://github.com/o/r/pull/12\n";
+        assert!(facts_preserved(body, ok));
+        assert!(!facts_preserved(body, "- dev の最新は `abc123` です。\n### #12 t\n"));
+        assert!(!facts_preserved(body, "### #12 t\nhttps://github.com/o/r/pull/12"));
+        assert_eq!(unfence("```markdown\nx\n```"), "x");
+    }
 
     #[test]
     fn merge_only_when_all_conditions_hold() {
