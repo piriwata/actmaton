@@ -181,7 +181,7 @@
     <td>リポジトリを監査し、次のタスクを1件、GitHub Issue として起票します（ラベル <code>actmaton-proposal</code>）。コードは変更しません。監査の仕組みは<a href="#audit">propose の監査</a>を参照してください。</td>
   </tr>
   <tr>
-    <td><code>actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N]</code><span class="badge pending">PR #35 マージ待ち</span></td>
+    <td><code>actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N] [--base dev]</code></td>
     <td>propose と run を自律的に繰り返します。テストが通った変更は push され、ドラフト PR が自動で開かれます。詳細は<a href="#loop">自律ループの仕組み</a>を参照してください。</td>
   </tr>
   <tr>
@@ -194,7 +194,7 @@
   <code>run</code> の引数は Issue 番号（<code>17</code> や <code>#17</code>）でも、Issue の URL でも構いません。
 </div>
 
-<h2 id="loop">自律ループの仕組み<span class="badge pending">PR #35 マージ待ち</span></h2>
+<h2 id="loop">自律ループの仕組み</h2>
 <p>
   <code>actmaton loop</code> は、人が1件ずつ指示しなくても開発が進み続けるためのコマンドです。
   各イテレーション（繰り返しの1回）で次のように動きます。
@@ -292,7 +292,7 @@
   朝にやることは、「朝のまとめ」PR を読んで、dev → main をマージするかどうかを決めることだけです。
 </div>
 
-<h2 id="audit">propose の監査<span class="badge pending">PR #33 マージ待ち</span></h2>
+<h2 id="audit">propose の監査</h2>
 <p>
   <code>propose</code> は「次の機能を思いつく」仕組みではありません。コードベースを<strong>監査</strong>し、
   証拠のある課題だけを Issue 化する仕組みです。設計の参考は
@@ -360,7 +360,7 @@
     <td>同じ Issue を再実行したとき、前回の worktree やブランチが残っていた場合の処理です。綺麗で先行コミットが無ければ作り直しますが、<strong>変更が残っている・コミットが進んでいる場合は、実行を拒否して何も消しません</strong>。人の作業や前回の成果が自動で消える事故を防ぎます。</td>
   </tr>
   <tr>
-    <td>自己修復<span class="badge pending">PR #31 マージ待ち</span></td>
+    <td>自己修復</td>
     <td>実装後に <code>cargo test</code> が落ちたら、失敗出力を次のセッションに渡して直させる、というフィードバックループです。再試行は最大2回まで。直らなければ worktree を残したまま失敗として終了します。</td>
   </tr>
   <tr>
@@ -407,7 +407,7 @@
 <h3>設定の優先順位<span class="badge pending">フラグ化は Issue #36</span></h3>
 <ol>
   <li><strong>CLI フラグ</strong>（<code>--model</code> / <code>--fusion-tier</code>）— 導入予定（Issue #36）。</li>
-  <li><strong>環境変数</strong>（<code>ACTMATON_MODEL</code>、<code>ACTMATON_FUSION_TIER</code>、役割別の上書き）— 現行の仕組み。<span class="badge pending">PR #30 マージ待ち</span></li>
+  <li><strong>環境変数</strong>（<code>ACTMATON_MODEL</code>、<code>ACTMATON_FUSION_TIER</code>、役割別の上書き）— 現行の仕組み。</li>
   <li><strong>組み込みの既定値</strong>（上の表）。</li>
 </ol>
 <p>ログには、どの経路で決まった設定かも併せて記録されます。</p>
@@ -444,11 +444,11 @@
     <td>監査のプロンプトとモデルの応答、参照チェック・前提チェックの結果、発見ごとの処分（起票／見送り／却下）が入ります。</td>
   </tr>
   <tr>
-    <td><code>loop-&lt;時刻&gt;.md</code>（loop レポート）<span class="badge pending">PR #35 マージ待ち</span></td>
+    <td><code>loop-&lt;時刻&gt;.md</code>（loop レポート）</td>
     <td>loop のイテレーションごとの記録。Issue、モデル、合否、PR リンク、1行要約と、最後に止まった理由が入ります。</td>
   </tr>
   <tr>
-    <td><code>propose-ledger.jsonl</code>（却下台帳）<span class="badge pending">PR #33 マージ待ち</span></td>
+    <td><code>propose-ledger.jsonl</code>（却下台帳）</td>
     <td>vet で落とした発見とその理由の台帳。次回の propose が読み込み、再提案を防ぎます。</td>
   </tr>
 </table>
@@ -477,7 +477,7 @@
   <dd>Copilot のモデル自動振り分けの仕組み。ティアは Standard（Auto Balance：タスクに応じてモデルを選び、今回のテストでは gpt-6-luna が選ばれた）、High（HydraFusion）、Max（HydraFusion Max）があります。ただし High / Max は現在のアカウントでは使えません。</dd>
 
   <dt>自己修復（self-repair）</dt>
-  <dd>テストが落ちたとき、失敗出力を次のセッションへ渡して直させる仕組み。上限回数つきです（PR #31 マージ待ち）。</dd>
+  <dd>テストが落ちたとき、失敗出力を次のセッションへ渡して直させる仕組み。上限回数つきです。</dd>
 
   <dt>dogfooding（ドッグフーディング）</dt>
   <dd>自分の製品を自分で使うこと。actmaton は自分のリポジトリの開発に actmaton 自身を使い、その過程で弱点を洗い出しています。</dd>
@@ -493,8 +493,6 @@
     （対象は <code>actmaton 0.1.0</code> 系）。
   </p>
   <p>
-    <span class="badge pending">PR #xx マージ待ち</span> と付いている項目は、実装が完了し PR がレビュー待ちの状態にある機能です。
-    マージされるまでは、main ブランチの actmaton ではまだ使えません。
     <span class="badge done">PR #xx 実装済み</span> は main に取り込み済みの機能です。
   </p>
   <p>
