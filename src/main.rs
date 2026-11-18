@@ -12,6 +12,7 @@ use github_copilot_sdk::handler::ApproveAllHandler;
 use github_copilot_sdk::{Client, ClientOptions, MessageOptions, SessionConfig};
 
 mod audit;
+mod devflow;
 mod loop_cmd;
 mod model;
 mod propose;
@@ -27,7 +28,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("run") => match args[2..].iter().find(|a| !a.starts_with("--")) {
             Some(issue_ref) => {
                 let dry_run = args[2..].iter().any(|a| a == "--dry-run");
-                run_loop::run(issue_ref, dry_run).await?
+                let base = args.iter().position(|a| a == "--base").and_then(|i| args.get(i + 1));
+                run_loop::run(issue_ref, dry_run, base.map(String::as_str)).await?
             }
             None => {
                 eprintln!("usage: actmaton run <issue-number-or-url> [--dry-run]");
@@ -51,7 +53,9 @@ usage: actmaton --version          # print the actmaton version
        actmaton run <issue|url> --dry-run  # print prompt and permission policy; no model call
        actmaton propose            # draft the next task as an actmaton-proposal issue
        actmaton propose --dry-run  # print the propose prompt; no model call, no issue created
-       actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N]
+       actmaton run <issue|url> --base dev  # branch from origin/dev (PR creation stays manual)
+       actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N] [--base dev]
+                                   # --base dev: PRs target dev, PASS iterations auto-merge into dev (red dev stops the loop), standing dev→main PR kept up to date; main is never merged
                                    # autonomous loop: first repairs conflicting actmaton PRs on their own branch, then runs oldest non-`hold` issue (or propose), push, open draft PR
 model selection (env vars; unset = auto): ACTMATON_MODEL, ACTMATON_FUSION_TIER (standard|high|max),
        per role: ACTMATON_RUN_MODEL, ACTMATON_PROPOSE_MODEL (and *_FUSION_TIER);
