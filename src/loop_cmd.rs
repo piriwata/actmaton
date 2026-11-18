@@ -438,9 +438,16 @@ fn item_from_json(v: &Value) -> crate::devflow::Item {
     }
 }
 
+/// SKILL.md (and ALWAYS.md when present) of the nihongo skill folder; `None` if SKILL.md is absent.
+fn load_nihongo(dir: &Path) -> Option<String> {
+    let skill = std::fs::read_to_string(dir.join("SKILL.md")).ok()?;
+    let always = std::fs::read_to_string(dir.join("ALWAYS.md")).unwrap_or_default();
+    Some(format!("{skill}\n\n{always}"))
+}
+
 /// Create or update the standing dev → main PR. Items persist across loop runs
 /// (in `dev-items.json`) and are kept while their merge is still ahead of main.
-fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use crate::devflow::{build_body, Morning};
     let store = dir.join("dev-items.json");
     let mut items: Vec<crate::devflow::Item> = std::fs::read_to_string(&store)
@@ -471,7 +478,7 @@ fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path: &Pat
     let items = crate::devflow::merge_shipped(items, shipped);
     std::fs::write(&store, serde_json::to_string(&items.iter().map(item_json).collect::<Vec<_>>())?)?;
 
-    let yomi = std::env::var("ACTMATON_YOMIYASU_DIR").ok().filter(|d| Path::new(d).join("yomiyasu_check.py").exists());
+    let nihongo = std::env::var("ACTMATON_NIHONGO_DIR").ok().and_then(|d| load_nihongo(Path::new(&d)));
     let mut m = Morning {
         remaining: dev.remaining.clone(),
         dev_head: git(root, &["rev-parse", "--short", "origin/dev"]).unwrap_or_else(|_| dev.dev_head.clone()),
@@ -479,19 +486,36 @@ fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path: &Pat
         iterations,
         human_touches,
         items,
-        yomiyasu_note: yomi.is_none().then(|| "yomiyasu を読み込めなかったため、この文章は文体ルールだけで書いています。".to_string()),
+        yomiyasu_note: None,
     };
     if let Some(h) = &dev.halt {
         m.remaining.insert(0, h.clone());
     }
-    let body = build_body(&m);
-    let body_file = dir.join("morning-pr-body.md");
-    std::fs::write(&body_file, &body)?;
-    if let Some(d) = yomi {
-        for script in ["yomiyasu_lint.py", "yomiyasu_check.py"] {
-            if let Ok(o) = Command::new("python3").arg(Path::new(&d).join(script)).arg(&body_file).output() {
-                report(report_path, &format!("- {script}: {}\n", one_line(&String::from_utf8_lossy(&o.stdout))));
+    let mut body = build_body(&m);
+    match nihongo {
+        Some(skill) => {
+            let prompt = crate::devflow::nihongo_prompt(&skill, &body);
+            match crate::propose::run_session(root, &prompt).await {
+                Ok((Some(reply), _)) if crate::devflow::facts_preserved(&body, crate::devflow::unfence(&reply)) => {
+                    body = crate::devflow::unfence(&reply).to_string();
+                    report(report_path, "- nihongo: PR body Japanese refined by a session with the nihongo skill loaded\n");
+                }
+                other => {
+                    let why = match other {
+                        Ok((Some(_), _)) => "refined text dropped facts".to_string(),
+                        Ok(_) => "session returned no final message".to_string(),
+                        Err(e) => one_line(&e.to_string()),
+                    };
+                    report(report_path, &format!("- !!! nihongo: refinement not used ({why}); body is the deterministic text\n"));
+                    m.yomiyasu_note = Some(crate::devflow::NIHONGO_NOTE.to_string());
+                    body = build_body(&m);
+                }
             }
+        }
+        None => {
+            report(report_path, "- !!! nihongo skill not found (set ACTMATON_NIHONGO_DIR to the folder containing SKILL.md); standing PR body carries the degradation note\n");
+            m.yomiyasu_note = Some(crate::devflow::NIHONGO_NOTE.to_string());
+            body = build_body(&m);
         }
     }
     let title = "dev → main: 朝のまとめ";
@@ -671,7 +695,7 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         report(&path, &line);
     }
     if dev_mode {
-        if let Err(e) = update_standing_pr(&dir, &root, &dev, &path) {
+        if let Err(e) = update_standing_pr(&dir, &root, &dev, &path).await {
             report(&path, &format!("- standing dev → main PR: !!! could not update: {}\n", one_line(&e.to_string())));
         }
     }
@@ -682,6 +706,18 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nihongo_skill_present_and_absent() {
+        let d = std::env::temp_dir().join(format!("actmaton-nihongo-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(load_nihongo(&d).is_none());
+        std::fs::write(d.join("SKILL.md"), "skill-text").unwrap();
+        std::fs::write(d.join("ALWAYS.md"), "always-text").unwrap();
+        let s = load_nihongo(&d).unwrap();
+        assert!(s.contains("skill-text") && s.contains("always-text"));
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     fn issue(n: u64, ts: &str, labels: &[&str]) -> BoardIssue {
         BoardIssue {

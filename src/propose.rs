@@ -473,7 +473,7 @@ fn write_log(
     Ok(path)
 }
 
-async fn run_session(
+pub(crate) async fn run_session(
     root: &Path,
     prompt: &str,
 ) -> Result<(Option<String>, Vec<String>), Box<dyn std::error::Error>> {

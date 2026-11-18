@@ -251,7 +251,8 @@
   <li>判定が PASS で、dev と衝突せず、dev のテストが通っているときだけ、ループ自身が PR を dev にマージします（squash なし）。</li>
   <li>マージのたびに dev のテストを回し直します。落ちたらループは止まり、レポートに目立つ形で残ります。</li>
   <li>ループの最後に、<code>dev → main</code> の「朝のまとめ」PR を作成または更新します。本文は日本語で、PR ごとに「やったこと／判断したこと／仮定したこと」と、残っている問題の一覧、dev のテスト状態、人が手を入れた割合を載せます。「特に注意／要確認／そのまま」に分けて並べます。</li>
-  <li><code>ACTMATON_YOMIYASU_DIR</code> に yomiyasu のスクリプトの場所を指定すると、本文に対して lint と check を実行し、結果をレポートに追記します。未指定の場合は、本文の冒頭にその旨を書き、文体ルールだけで作ります。</li>
+  <li>本文の事実（取り込んだ PR、リンク、テスト状態）は決まった手順で組み立てます。そのうえで、日本語の文章だけを、nihongo スキル（<a href="https://github.com/AnIT012/nihongo">AnIT012/nihongo</a>）を読み込んだセッションが直します。スキルのフォルダ（<code>SKILL.md</code> と <code>ALWAYS.md</code> があるところ。例: <code>~/workspace/tools/nihongo/nihongo</code>）は環境変数 <code>ACTMATON_NIHONGO_DIR</code> で指定します。セッションが返した本文から PR 番号・リンク・コード片が欠けた場合は、直した文章を使いません。</li>
+  <li>スキルが見つからないとき、または直しを使えなかったときは、レポートに <code>!!!</code> 付きの警告を残し、本文の冒頭にその旨を書いて、文体ルールだけで作ります。</li>
 </ul>
 <div class="note">
   main は常に人のものです。dev は、テストが通っている間は自動です。
