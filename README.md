@@ -24,7 +24,7 @@ GitHub Issues, PRs, and CI hold the backlog, decisions, and results. The initial
 
 Memory, not CPU, is the binding constraint on small hosts (an 8 GB VM hit the OOM killer twice in unattended runs). The loop's own `cargo test` verification therefore runs with `CARGO_BUILD_JOBS=1` and `CARGO_PROFILE_DEV_DEBUG=0` by default, and the run log records the settings used. This trades wall time (slower builds) for lower peak memory. Set either variable in the environment to override it, e.g. `CARGO_BUILD_JOBS=8` on a roomy machine.
 
-Measured limit: the single `rustc` compiling `github-copilot-sdk` peaks at about 5.1 GB RSS regardless of these settings. Disabling the SDK's default features (`default-features = false`) only lowered it to about 4.3 GB, so it was not adopted. To avoid paying that peak repeatedly, share one `CARGO_TARGET_DIR` across worktrees.
+Measured limit: the single `rustc` compiling `github-copilot-sdk` peaks at about 5.1 GB RSS regardless of these settings. Disabling the SDK's default features (`default-features = false`) only lowered it to about 4.3 GB, so it was not adopted. To avoid paying that peak repeatedly, the loop shares one `CARGO_TARGET_DIR` across all issue worktrees by default: `actmaton-target`, next to the clone (alongside the `actmaton-issue-N` worktrees). Dependencies such as the SDK compile once and later runs build incrementally. The loop's verification and the sessions it spawns both use it, and the run log records it. Set `CARGO_TARGET_DIR` in the environment to use another location. The loop never cleans this directory; prune it manually if it grows too large.
 
 ## Roadmap
 

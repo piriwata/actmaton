@@ -103,6 +103,7 @@ pub async fn run(issue_ref: &str, dry_run: bool) -> Result<(), Box<dyn std::erro
 /// Result of one full run of an issue (worktree, session, verification).
 pub(crate) struct Outcome {
     pub title: String,
+    pub issue_body: String,
     pub url: String,
     pub branch: String,
     pub worktree: PathBuf,
@@ -123,6 +124,7 @@ pub(crate) async fn run_number(number: u64) -> Result<Outcome, Box<dyn std::erro
 
 async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std::error::Error>> {
     let number = issue.number;
+    ensure_shared_target_dir(repo_root);
     let log: RunLog = Arc::new(Mutex::new(Vec::new()));
     log_line(&log, format!("issue #{}: {} ({})", issue.number, issue.title, issue.url));
 
@@ -197,6 +199,7 @@ async fn execute(issue: &Issue, repo_root: &Path) -> Result<Outcome, Box<dyn std
 
     Ok(Outcome {
         title: issue.title.clone(),
+        issue_body: issue.body.clone(),
         url: issue.url.clone(),
         branch,
         worktree,
@@ -1019,10 +1022,26 @@ const BUILD_ENV_DEFAULTS: [(&str, &str); 2] =
     [("CARGO_BUILD_JOBS", "1"), ("CARGO_PROFILE_DEV_DEBUG", "0")];
 
 fn build_settings() -> Vec<(&'static str, String)> {
-    BUILD_ENV_DEFAULTS
+    let mut settings: Vec<_> = BUILD_ENV_DEFAULTS
         .iter()
         .map(|(k, v)| (*k, std::env::var(k).unwrap_or_else(|_| v.to_string())))
-        .collect()
+        .collect();
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        settings.push(("CARGO_TARGET_DIR", dir));
+    }
+    settings
+}
+
+/// Point every cargo invocation (ours and the sessions' inherited ones) at one
+/// shared target dir next to the clone, unless the user already set one.
+fn ensure_shared_target_dir(repo_root: &Path) {
+    if std::env::var_os("CARGO_TARGET_DIR").is_some() {
+        return;
+    }
+    if let Some(parent) = repo_root.parent() {
+        // SAFETY: called at the start of a run, before any session is spawned.
+        unsafe { std::env::set_var("CARGO_TARGET_DIR", parent.join("actmaton-target")) };
+    }
 }
 
 fn build_settings_text() -> String {
