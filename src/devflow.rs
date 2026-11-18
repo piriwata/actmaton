@@ -95,6 +95,29 @@ fn or_none(s: &str) -> &str {
     }
 }
 
+/// PR number and title from a commit subject such as `title (#12)` or
+/// `Merge pull request #12 from x/y`.
+pub fn pr_from_subject(subject: &str) -> Option<(u64, String)> {
+    let at = subject.find('#')?;
+    let digits: String = subject[at + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let pr = digits.parse().ok()?;
+    let title = subject[..at].trim_end().trim_end_matches('(').trim_end();
+    let title = if title.is_empty() || title.starts_with("Merge pull request") { subject } else { title };
+    Some((pr, title.to_string()))
+}
+
+/// Reconcile recorded loop items with the PRs actually in dev but not in main:
+/// drop items no longer ahead, and add ahead PRs that entered dev by another route.
+pub fn merge_shipped(items: Vec<Item>, shipped: Vec<Item>) -> Vec<Item> {
+    let mut out: Vec<Item> = items.into_iter().filter(|i| shipped.iter().any(|s| s.pr == i.pr)).collect();
+    for s in shipped {
+        if !out.iter().any(|i| i.pr == s.pr) {
+            out.push(Item { human: true, ..s });
+        }
+    }
+    out
+}
+
 fn render_item(i: &Item) -> String {
     let who = if i.human { "（人が作成）" } else { "" };
     let mut s = format!("### #{} {}{}\n- リンク: {}\n", i.pr, i.title, who, i.url);
@@ -229,6 +252,21 @@ mod tests {
         let t = "## Summary\nx\n## Decisions\n- chose A\n## Assumptions\n- B holds\n## Other\nz";
         assert_eq!(extract_section(t, &["decision"]), "chose A");
         assert_eq!(extract_section(t, &["assumption"]), "B holds");
+    }
+
+    #[test]
+    fn body_lists_loop_merged_and_manually_merged_prs() {
+        let loop_item = Item { pr: 7, title: "ループの変更".into(), url: "https://example/pull/7".into(), files: vec!["docs/a.md".into()], ..Default::default() };
+        let (pr, title) = pr_from_subject("手動の変更 (#67)").unwrap();
+        let manual = Item { pr, title, url: "https://example/pull/67".into(), files: vec!["src/model.rs".into()], ..Default::default() };
+        let stale = Item { pr: 5, ..Default::default() };
+        let shipped = vec![loop_item.clone(), manual];
+        let items = merge_shipped(vec![loop_item, stale], shipped);
+        let b = build_body(&Morning { items, dev_green: true, ..Default::default() });
+        assert!(b.contains("取り込んだ PR: 2 件"), "{b}");
+        assert!(b.contains("### #7 ループの変更"), "{b}");
+        assert!(b.contains("### #67 手動の変更"), "{b}");
+        assert!(!b.contains("### #5 "), "{b}");
     }
 
     #[test]
