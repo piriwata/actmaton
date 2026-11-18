@@ -13,8 +13,10 @@
 //!
 //! Verdict: FAIL if `cargo test` fails; PASS if tests pass and every done/
 //! acceptance criterion in the issue is reported `VERIFIED` by the session
-//! (or the issue states none); otherwise PARTIAL, with the `NOT-VERIFIED` /
-//! `HUMAN-CHECK` criteria named in the loop report and the PR body.
+//! (or the issue states none); otherwise PARTIAL-HUMAN-ONLY (only `HUMAN-CHECK`
+//! criteria remain; also merged into dev, items listed under 要確認 in the
+//! standing PR) or PARTIAL-BLOCKED (some criterion `NOT-VERIFIED`; not merged),
+//! with the unverified criteria named in the loop report and the PR body.
 
 use std::io::Write;
 use std::path::Path;
@@ -385,7 +387,7 @@ fn dev_gate(root: &Path) -> Result<(bool, String), Box<dyn std::error::Error>> {
 
 /// Ready the PR, merge it into dev (merge commit) if the decision allows, then
 /// re-test dev. A red dev sets `dev.halt`. Returns a short status for the report.
-fn merge_into_dev(pr: &str, pass: bool, root: &Path, dev: &mut DevState) -> Result<String, Box<dyn std::error::Error>> {
+fn merge_into_dev(pr: &str, verdict: &Verdict, root: &Path, dev: &mut DevState) -> Result<String, Box<dyn std::error::Error>> {
     let _ = gh(&["pr", "ready", pr, "--repo", REPO]);
     let (mut base, mut mergeable) = (String::new(), String::new());
     for _ in 0..6 {
@@ -397,7 +399,7 @@ fn merge_into_dev(pr: &str, pass: bool, root: &Path, dev: &mut DevState) -> Resu
         }
         std::thread::sleep(Duration::from_secs(5));
     }
-    if !crate::devflow::should_merge(pass, &base, &mergeable, dev.dev_green) {
+    if !crate::devflow::should_merge(verdict, &base, &mergeable, dev.dev_green) {
         return Ok(format!("not merged (base={base}, mergeable={mergeable}, dev green={})", dev.dev_green));
     }
     gh(&["pr", "merge", pr, "--repo", REPO, "--merge"])?;
@@ -415,7 +417,7 @@ fn merge_into_dev(pr: &str, pass: bool, root: &Path, dev: &mut DevState) -> Resu
 fn item_json(i: &crate::devflow::Item) -> Value {
     serde_json::json!({"pr": i.pr, "title": i.title, "url": i.url, "human": i.human,
         "implemented": i.implemented, "decisions": i.decisions, "assumptions": i.assumptions,
-        "files": i.files, "repair_attempts": i.repair_attempts, "repair_note": i.repair_note})
+        "files": i.files, "repair_attempts": i.repair_attempts, "human_checks": i.human_checks, "repair_note": i.repair_note})
 }
 
 fn item_from_json(v: &Value) -> crate::devflow::Item {
@@ -430,6 +432,7 @@ fn item_from_json(v: &Value) -> crate::devflow::Item {
         assumptions: s("assumptions"),
         files: v["files"].as_array().map(|a| a.iter().filter_map(|f| f.as_str().map(String::from)).collect()).unwrap_or_default(),
         repair_attempts: v["repair_attempts"].as_u64().unwrap_or(0) as u32,
+        human_checks: v["human_checks"].as_array().map(|a| a.iter().filter_map(|f| f.as_str().map(String::from)).collect()).unwrap_or_default(),
         repair_note: v["repair_note"].as_str().map(String::from),
     }
 }
@@ -520,7 +523,7 @@ async fn do_iteration(
         return Ok((format!("#{number} {}", o.title), model, "FAIL (tests failing)".into(), "-".into(), summary, None));
     }
     let unverified = match &verdict {
-        Verdict::Partial(_) => format!("\nVerdict: PARTIAL. Unverified criteria:\n{}", verdict.unverified_text()),
+        Verdict::Partial(_) => format!("\nVerdict: {}. Unverified criteria:\n{}", verdict.label(), verdict.unverified_text()),
         _ => String::new(),
     };
     let final_message = o.final_message.clone().unwrap_or_default();
@@ -533,13 +536,16 @@ async fn do_iteration(
     let pr = push_and_open_draft_pr(&o.worktree, &o.branch, number, &o.title, &body, base)
         .map_err(|e| (label, e))?;
     let mut summary = match verdict {
-        Verdict::Partial(_) => format!("{summary} | unverified: {}", verdict.unverified_text().replace('\n', " ")),
+        Verdict::Partial(_) => format!(
+            "{summary} | {}: {}",
+            if verdict.human_only() { "human-check items" } else { "unverified" },
+            verdict.unverified_text().replace('\n', " ")
+        ),
         _ => summary,
     };
     if base == Some(crate::devflow::DEV) {
-        let pass = verdict == Verdict::Pass;
         let status = repo_root()
-            .and_then(|root| merge_into_dev(&pr, pass, &root, dev))
+            .and_then(|root| merge_into_dev(&pr, &verdict, &root, dev))
             .unwrap_or_else(|e| format!("merge error: {}", one_line(&e.to_string())));
         summary = format!("{summary} | {status}");
         let files = git(&o.worktree, &["diff", "--name-only", &format!("origin/{}...HEAD", crate::devflow::DEV)])
@@ -557,6 +563,7 @@ async fn do_iteration(
                 assumptions: crate::devflow::extract_section(&fm, &["assumption"]),
                 files,
                 repair_attempts: o.repair_attempts,
+                human_checks: verdict.human_checks(),
                 repair_note: None,
             });
         } else {

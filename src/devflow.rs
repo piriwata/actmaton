@@ -4,10 +4,12 @@
 
 pub const DEV: &str = "dev";
 
-/// Merge into dev only when the run passed, the PR targets dev, git sees no
-/// conflict, and dev's tree is green.
-pub fn should_merge(verdict_pass: bool, base: &str, mergeable: &str, dev_green: bool) -> bool {
-    verdict_pass && base == DEV && mergeable == "MERGEABLE" && dev_green
+/// Merge into dev only when the run passed (or is a human-only PARTIAL, whose
+/// human checks are deferred to the standing PR), the PR targets dev, git sees
+/// no conflict, and dev's tree is green.
+pub fn should_merge(verdict: &crate::run_loop::Verdict, base: &str, mergeable: &str, dev_green: bool) -> bool {
+    let qualifies = *verdict == crate::run_loop::Verdict::Pass || verdict.human_only();
+    qualifies && base == DEV && mergeable == "MERGEABLE" && dev_green
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -48,6 +50,8 @@ pub struct Item {
     pub assumptions: String,
     pub files: Vec<String>,
     pub repair_attempts: u32,
+    /// Outstanding human-check criteria of a merged human-only PARTIAL.
+    pub human_checks: Vec<String>,
     /// What the orchestrator did on a human PR's behalf (conflict repair).
     pub repair_note: Option<String>,
 }
@@ -100,6 +104,12 @@ fn render_item(i: &Item) -> String {
     if i.repair_attempts > 0 {
         s.push_str(&format!("- テストの直しが {} 回ありました。\n", i.repair_attempts));
     }
+    if !i.human_checks.is_empty() {
+        s.push_str("- 人が確認すること（未確認のまま dev に入りました）:\n");
+        for c in &i.human_checks {
+            s.push_str(&format!("  - {c}\n"));
+        }
+    }
     if let Some(n) = &i.repair_note {
         s.push_str(&format!("- 代わりに直したこと: {n}\n"));
     }
@@ -135,8 +145,15 @@ pub fn build_body(m: &Morning) -> String {
         (Stratum::Check, "## 要確認（直しが入った、または中心のファイルに触れています）"),
         (Stratum::AsIs, "## そのまま（独立した変更で、一度でテストが通りました）"),
     ] {
-        let group: Vec<&Item> =
-            m.items.iter().filter(|i| classify(&i.files, i.repair_attempts) == stratum).collect();
+        let group: Vec<&Item> = m
+            .items
+            .iter()
+            .filter(|i| {
+                let s = classify(&i.files, i.repair_attempts);
+                let s = if s == Stratum::AsIs && !i.human_checks.is_empty() { Stratum::Check } else { s };
+                s == stratum
+            })
+            .collect();
         if group.is_empty() {
             continue;
         }
@@ -162,12 +179,40 @@ mod tests {
 
     #[test]
     fn merge_only_when_all_conditions_hold() {
-        assert!(should_merge(true, "dev", "MERGEABLE", true));
-        assert!(!should_merge(false, "dev", "MERGEABLE", true));
-        assert!(!should_merge(true, "main", "MERGEABLE", true));
-        assert!(!should_merge(true, "dev", "CONFLICTING", true));
-        assert!(!should_merge(true, "dev", "UNKNOWN", true));
-        assert!(!should_merge(true, "dev", "MERGEABLE", false));
+        use crate::run_loop::Verdict;
+        let pass = Verdict::Pass;
+        assert!(should_merge(&pass, "dev", "MERGEABLE", true));
+        assert!(!should_merge(&Verdict::Fail, "dev", "MERGEABLE", true));
+        assert!(!should_merge(&pass, "main", "MERGEABLE", true));
+        assert!(!should_merge(&pass, "dev", "CONFLICTING", true));
+        assert!(!should_merge(&pass, "dev", "UNKNOWN", true));
+        assert!(!should_merge(&pass, "dev", "MERGEABLE", false));
+    }
+
+    #[test]
+    fn human_only_partial_merges_blocked_partial_does_not() {
+        use crate::run_loop::Verdict;
+        let human = Verdict::Partial(vec![("a".into(), true)]);
+        let blocked = Verdict::Partial(vec![("a".into(), true), ("b".into(), false)]);
+        assert!(should_merge(&human, "dev", "MERGEABLE", true));
+        assert!(!should_merge(&human, "main", "MERGEABLE", true));
+        assert!(!should_merge(&blocked, "dev", "MERGEABLE", true));
+    }
+
+    #[test]
+    fn human_only_item_listed_under_check_with_items() {
+        let m = Morning {
+            items: vec![Item {
+                pr: 9,
+                files: vec!["docs/a.md".into()],
+                human_checks: vec!["文章が自然か".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let b = build_body(&m);
+        assert!(b.contains("## 要確認") && b.contains("文章が自然か"), "{b}");
+        assert!(!b.contains("## そのまま"));
     }
 
     #[test]
