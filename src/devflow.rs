@@ -54,6 +54,25 @@ pub struct Item {
     pub human_checks: Vec<String>,
     /// What the orchestrator did on a human PR's behalf (conflict repair).
     pub repair_note: Option<String>,
+    /// Issues this PR closes; GitHub only auto-closes on the default branch,
+    /// so the standing PR repeats them.
+    pub closes: Vec<u64>,
+}
+
+/// Issue numbers named by closing keywords (`Closes #4`, `fixes #5`, `Resolved #6`).
+pub fn closing_issues(text: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for w in words.windows(2) {
+        let kw = w[0].trim_end_matches(':').to_lowercase();
+        let is_kw = ["close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved"].contains(&kw.as_str());
+        if let (true, Some(n)) = (is_kw, w[1].strip_prefix('#').and_then(|d| d.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<u64>().ok())) {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -186,6 +205,16 @@ pub fn build_body(m: &Morning) -> String {
             s.push_str(&render_item(i));
         }
     }
+    let mut closes: Vec<u64> = m.items.iter().flat_map(|i| i.closes.iter().copied()).collect();
+    closes.sort_unstable();
+    closes.dedup();
+    if !closes.is_empty() {
+        s.push_str("## このマージで閉じる Issue\n");
+        for n in closes {
+            s.push_str(&format!("Closes #{n}\n"));
+        }
+        s.push('\n');
+    }
     s.push_str("## 残っている問題と制限\n");
     if m.remaining.is_empty() {
         s.push_str("- 今回の実行では、記録された問題はありません。\n");
@@ -267,6 +296,21 @@ mod tests {
         assert!(b.contains("### #7 ループの変更"), "{b}");
         assert!(b.contains("### #67 手動の変更"), "{b}");
         assert!(!b.contains("### #5 "), "{b}");
+    }
+
+    #[test]
+    fn body_closes_only_issues_of_promoted_prs() {
+        assert_eq!(closing_issues("Closes #44\n\nfixes #52, see #9"), vec![44, 52]);
+        let it = |pr, closes: Vec<u64>| Item { pr, closes, ..Default::default() };
+        let shipped = vec![it(67, vec![44]), it(68, vec![52]), it(74, vec![73])];
+        let stale = it(60, vec![10]);
+        let items = merge_shipped(vec![stale], shipped);
+        let b = build_body(&Morning { items, ..Default::default() });
+        for n in [44, 52, 73] {
+            assert!(b.contains(&format!("Closes #{n}\n")), "{b}");
+        }
+        assert!(!b.contains("Closes #10"), "{b}");
+        assert!(!build_body(&Morning::default()).contains("Closes"));
     }
 
     #[test]

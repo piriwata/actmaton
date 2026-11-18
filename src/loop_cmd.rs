@@ -417,7 +417,7 @@ fn merge_into_dev(pr: &str, verdict: &Verdict, root: &Path, dev: &mut DevState) 
 fn item_json(i: &crate::devflow::Item) -> Value {
     serde_json::json!({"pr": i.pr, "title": i.title, "url": i.url, "human": i.human,
         "implemented": i.implemented, "decisions": i.decisions, "assumptions": i.assumptions,
-        "files": i.files, "repair_attempts": i.repair_attempts, "human_checks": i.human_checks, "repair_note": i.repair_note})
+        "files": i.files, "repair_attempts": i.repair_attempts, "human_checks": i.human_checks, "repair_note": i.repair_note, "closes": i.closes})
 }
 
 fn item_from_json(v: &Value) -> crate::devflow::Item {
@@ -434,6 +434,7 @@ fn item_from_json(v: &Value) -> crate::devflow::Item {
         repair_attempts: v["repair_attempts"].as_u64().unwrap_or(0) as u32,
         human_checks: v["human_checks"].as_array().map(|a| a.iter().filter_map(|f| f.as_str().map(String::from)).collect()).unwrap_or_default(),
         repair_note: v["repair_note"].as_str().map(String::from),
+        closes: v["closes"].as_array().map(|a| a.iter().filter_map(|f| f.as_u64()).collect()).unwrap_or_default(),
     }
 }
 
@@ -461,7 +462,10 @@ fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path: &Pat
             let files = git(root, &["diff", "--name-only", &format!("{sha}^1"), sha])
                 .map(|o| o.lines().map(String::from).collect())
                 .unwrap_or_default();
-            Some(crate::devflow::Item { pr, title, url: format!("https://github.com/{REPO}/pull/{pr}"), files, ..Default::default() })
+            let closes = gh(&["pr", "view", &pr.to_string(), "--repo", REPO, "--json", "body", "--jq", ".body"])
+                .map(|b| crate::devflow::closing_issues(&b))
+                .unwrap_or_default();
+            Some(crate::devflow::Item { pr, title, url: format!("https://github.com/{REPO}/pull/{pr}"), files, closes, ..Default::default() })
         })
         .collect();
     let items = crate::devflow::merge_shipped(items, shipped);
@@ -578,6 +582,7 @@ async fn do_iteration(
                 repair_attempts: o.repair_attempts,
                 human_checks: verdict.human_checks(),
                 repair_note: None,
+                closes: vec![number],
             });
         } else {
             dev.remaining.push(format!("{pr}（#{number}）はマージされていません: {status}"));
