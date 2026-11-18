@@ -6,12 +6,17 @@
 //! `propose` files a new issue, which becomes that iteration's work.
 //! After a non-failing run the branch is pushed and a *draft* PR is opened here,
 //! in the orchestrator process (never inside the agent session). Merging is
-//! left to the user.
+//! left to the user, except in dev mode (`--base dev`): PRs target `dev` and a
+//! PASS iteration is merged into dev (merge commit) once dev stays green; a red
+//! dev stops the loop. The standing `dev` → `main` PR is only ever created or
+//! updated here, never merged (main is always the user's).
 //!
 //! Verdict: FAIL if `cargo test` fails; PASS if tests pass and every done/
 //! acceptance criterion in the issue is reported `VERIFIED` by the session
-//! (or the issue states none); otherwise PARTIAL, with the `NOT-VERIFIED` /
-//! `HUMAN-CHECK` criteria named in the loop report and the PR body.
+//! (or the issue states none); otherwise PARTIAL-HUMAN-ONLY (only `HUMAN-CHECK`
+//! criteria remain; also merged into dev, items listed under 要確認 in the
+//! standing PR) or PARTIAL-BLOCKED (some criterion `NOT-VERIFIED`; not merged),
+//! with the unverified criteria named in the loop report and the PR body.
 
 use std::io::Write;
 use std::path::Path;
@@ -30,11 +35,13 @@ pub struct Limits {
     pub max_iterations: u32,
     pub max_failures: u32,
     pub budget: Duration,
+    /// Branch the loop's PRs and worktrees target; `None` = main, no auto-merge.
+    pub base: Option<String>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_iterations: 5, max_failures: 2, budget: Duration::from_secs(4 * 3600) }
+        Limits { max_iterations: 5, max_failures: 2, budget: Duration::from_secs(4 * 3600), base: None }
     }
 }
 
@@ -187,6 +194,7 @@ fn parse_args(args: &[String]) -> Result<Limits, String> {
             "--max-iterations" => l.max_iterations = val(a)? as u32,
             "--max-failures" => l.max_failures = val(a)? as u32,
             "--budget-minutes" => l.budget = Duration::from_secs(val(a)? * 60),
+            "--base" => l.base = Some(it.next().ok_or("--base needs a branch name")?.clone()),
             other => return Err(format!("unknown loop argument: {other}")),
         }
     }
@@ -231,6 +239,7 @@ fn push_and_open_draft_pr(
     number: u64,
     title: &str,
     summary: &str,
+    base: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if !git(worktree, &["status", "--porcelain"])?.trim().is_empty() {
         git(worktree, &["add", "-A"])?;
@@ -238,11 +247,12 @@ fn push_and_open_draft_pr(
     }
     git(worktree, &["push", "-u", "origin", branch])?;
     let body = format!("Closes #{number}\n\n{summary}");
-    let out = Command::new("gh")
-        .args([
-            "pr", "create", "--draft", "--repo", REPO, "--head", branch, "--title", title,
-            "--body", &body,
-        ])
+    let mut cmd = Command::new("gh");
+    cmd.args(["pr", "create", "--draft", "--repo", REPO, "--head", branch, "--title", title, "--body", &body]);
+    if let Some(b) = base {
+        cmd.args(["--base", b]);
+    }
+    let out = cmd
         .current_dir(worktree)
         .output()?;
     if !out.status.success() {
@@ -342,6 +352,142 @@ fn report(path: &Path, text: &str) {
     }
 }
 
+/// Dev-mode bookkeeping for the standing dev → main PR.
+#[derive(Default)]
+struct DevState {
+    items: Vec<crate::devflow::Item>,
+    remaining: Vec<String>,
+    dev_green: bool,
+    dev_head: String,
+    halt: Option<String>,
+}
+
+fn gh(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let out = Command::new("gh").args(args).output()?;
+    if !out.status.success() {
+        return Err(format!("gh {} failed: {}", args[..2.min(args.len())].join(" "), String::from_utf8_lossy(&out.stderr).trim()).into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Run cargo test on a fresh checkout of origin/dev in a sibling worktree.
+fn dev_gate(root: &Path) -> Result<(bool, String), Box<dyn std::error::Error>> {
+    use crate::devflow::DEV;
+    git(root, &["fetch", "origin", DEV])?;
+    let wt = root.parent().ok_or("repo root has no parent directory")?.join("actmaton-dev");
+    let origin = format!("origin/{DEV}");
+    if wt.exists() {
+        git(&wt, &["checkout", "--detach", &origin])?;
+    } else {
+        git(root, &["worktree", "add", "--detach", wt.to_str().ok_or("path is not UTF-8")?, &origin])?;
+    }
+    let head = git(&wt, &["rev-parse", "--short", "HEAD"])?;
+    Ok((crate::run_loop::cargo_test(&wt).0, head))
+}
+
+/// Ready the PR, merge it into dev (merge commit) if the decision allows, then
+/// re-test dev. A red dev sets `dev.halt`. Returns a short status for the report.
+fn merge_into_dev(pr: &str, verdict: &Verdict, root: &Path, dev: &mut DevState) -> Result<String, Box<dyn std::error::Error>> {
+    let _ = gh(&["pr", "ready", pr, "--repo", REPO]);
+    let (mut base, mut mergeable) = (String::new(), String::new());
+    for _ in 0..6 {
+        let v: Value = serde_json::from_str(&gh(&["pr", "view", pr, "--repo", REPO, "--json", "mergeable,baseRefName"])?)?;
+        base = v["baseRefName"].as_str().unwrap_or_default().to_string();
+        mergeable = v["mergeable"].as_str().unwrap_or_default().to_string();
+        if mergeable != "UNKNOWN" {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    if !crate::devflow::should_merge(verdict, &base, &mergeable, dev.dev_green) {
+        return Ok(format!("not merged (base={base}, mergeable={mergeable}, dev green={})", dev.dev_green));
+    }
+    gh(&["pr", "merge", pr, "--repo", REPO, "--merge"])?;
+    let (ok, head) = dev_gate(root)?;
+    dev.dev_green = ok;
+    dev.dev_head = head;
+    if ok {
+        Ok("merged into dev; dev tests PASS".into())
+    } else {
+        dev.halt = Some(format!("!!! dev tests FAIL after merging {pr}; nothing further is merged"));
+        Ok("merged into dev; !!! dev tests FAIL".into())
+    }
+}
+
+fn item_json(i: &crate::devflow::Item) -> Value {
+    serde_json::json!({"pr": i.pr, "title": i.title, "url": i.url, "human": i.human,
+        "implemented": i.implemented, "decisions": i.decisions, "assumptions": i.assumptions,
+        "files": i.files, "repair_attempts": i.repair_attempts, "human_checks": i.human_checks, "repair_note": i.repair_note})
+}
+
+fn item_from_json(v: &Value) -> crate::devflow::Item {
+    let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    crate::devflow::Item {
+        pr: v["pr"].as_u64().unwrap_or(0),
+        title: s("title"),
+        url: s("url"),
+        human: v["human"].as_bool().unwrap_or(false),
+        implemented: s("implemented"),
+        decisions: s("decisions"),
+        assumptions: s("assumptions"),
+        files: v["files"].as_array().map(|a| a.iter().filter_map(|f| f.as_str().map(String::from)).collect()).unwrap_or_default(),
+        repair_attempts: v["repair_attempts"].as_u64().unwrap_or(0) as u32,
+        human_checks: v["human_checks"].as_array().map(|a| a.iter().filter_map(|f| f.as_str().map(String::from)).collect()).unwrap_or_default(),
+        repair_note: v["repair_note"].as_str().map(String::from),
+    }
+}
+
+/// Create or update the standing dev → main PR. Items persist across loop runs
+/// (in `dev-items.json`) and are kept while their merge is still ahead of main.
+fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::devflow::{build_body, Morning};
+    let store = dir.join("dev-items.json");
+    let mut items: Vec<crate::devflow::Item> = std::fs::read_to_string(&store)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok())
+        .map(|v| v.iter().map(item_from_json).collect())
+        .unwrap_or_default();
+    items.retain(|i| !dev.items.iter().any(|n| n.pr == i.pr));
+    items.extend(dev.items.iter().cloned());
+    git(root, &["fetch", "origin", "main", "dev"])?;
+    let ahead = git(root, &["log", "origin/main..origin/dev", "--format=%s"])?;
+    items.retain(|i| ahead.contains(&format!("#{} ", i.pr)));
+    std::fs::write(&store, serde_json::to_string(&items.iter().map(item_json).collect::<Vec<_>>())?)?;
+
+    let yomi = std::env::var("ACTMATON_YOMIYASU_DIR").ok().filter(|d| Path::new(d).join("yomiyasu_check.py").exists());
+    let mut m = Morning {
+        remaining: dev.remaining.clone(),
+        dev_head: dev.dev_head.clone(),
+        dev_green: dev.dev_green,
+        iterations: items.len() as u32,
+        human_touches: items.iter().filter(|i| i.human).count() as u32,
+        items,
+        yomiyasu_note: yomi.is_none().then(|| "yomiyasu を読み込めなかったため、この文章は文体ルールだけで書いています。".to_string()),
+    };
+    if let Some(h) = &dev.halt {
+        m.remaining.insert(0, h.clone());
+    }
+    let body = build_body(&m);
+    let body_file = dir.join("morning-pr-body.md");
+    std::fs::write(&body_file, &body)?;
+    if let Some(d) = yomi {
+        for script in ["yomiyasu_lint.py", "yomiyasu_check.py"] {
+            if let Ok(o) = Command::new("python3").arg(Path::new(&d).join(script)).arg(&body_file).output() {
+                report(report_path, &format!("- {script}: {}\n", one_line(&String::from_utf8_lossy(&o.stdout))));
+            }
+        }
+    }
+    let title = "dev → main: 朝のまとめ";
+    let existing = gh(&["pr", "list", "--repo", REPO, "--base", "main", "--head", crate::devflow::DEV, "--state", "open", "--json", "number", "--jq", ".[0].number"])?;
+    let url = if existing.is_empty() {
+        gh(&["pr", "create", "--repo", REPO, "--base", "main", "--head", crate::devflow::DEV, "--title", title, "--body", &body])?
+    } else {
+        gh(&["pr", "edit", &existing, "--repo", REPO, "--title", title, "--body", &body])?
+    };
+    report(report_path, &format!("- standing dev → main PR: {url}\n"));
+    Ok(())
+}
+
 /// What the self-review needs from one passing iteration.
 struct Reviewed {
     model: String,
@@ -356,6 +502,8 @@ struct Reviewed {
 async fn do_iteration(
     action: &Action,
     attempted: &mut Vec<u64>,
+    base: Option<&str>,
+    dev: &mut DevState,
 ) -> Result<(String, String, String, String, String, Option<Reviewed>), (String, Box<dyn std::error::Error>)> {
     let number = match action {
         Action::Run(n) => *n,
@@ -367,7 +515,7 @@ async fn do_iteration(
     };
     attempted.push(number);
     let label = format!("#{number}");
-    let o = run_number(number).await.map_err(|e| (label.clone(), e))?;
+    let o = run_number(number, base).await.map_err(|e| (label.clone(), e))?;
     let summary = one_line(o.final_message.as_deref().unwrap_or(""));
     let model = o.model.clone().unwrap_or_else(|| "(not reported)".into());
     let verdict = decide_verdict(o.tests_ok, &o.criteria, o.final_message.as_deref());
@@ -375,7 +523,7 @@ async fn do_iteration(
         return Ok((format!("#{number} {}", o.title), model, "FAIL (tests failing)".into(), "-".into(), summary, None));
     }
     let unverified = match &verdict {
-        Verdict::Partial(_) => format!("\nVerdict: PARTIAL. Unverified criteria:\n{}", verdict.unverified_text()),
+        Verdict::Partial(_) => format!("\nVerdict: {}. Unverified criteria:\n{}", verdict.label(), verdict.unverified_text()),
         _ => String::new(),
     };
     let final_message = o.final_message.clone().unwrap_or_default();
@@ -385,12 +533,43 @@ async fn do_iteration(
         o.url,
         o.log_path.display()
     );
-    let pr = push_and_open_draft_pr(&o.worktree, &o.branch, number, &o.title, &body)
+    let pr = push_and_open_draft_pr(&o.worktree, &o.branch, number, &o.title, &body, base)
         .map_err(|e| (label, e))?;
-    let summary = match verdict {
-        Verdict::Partial(_) => format!("{summary} | unverified: {}", verdict.unverified_text().replace('\n', " ")),
+    let mut summary = match verdict {
+        Verdict::Partial(_) => format!(
+            "{summary} | {}: {}",
+            if verdict.human_only() { "human-check items" } else { "unverified" },
+            verdict.unverified_text().replace('\n', " ")
+        ),
         _ => summary,
     };
+    if base == Some(crate::devflow::DEV) {
+        let status = repo_root()
+            .and_then(|root| merge_into_dev(&pr, &verdict, &root, dev))
+            .unwrap_or_else(|e| format!("merge error: {}", one_line(&e.to_string())));
+        summary = format!("{summary} | {status}");
+        let files = git(&o.worktree, &["diff", "--name-only", &format!("origin/{}...HEAD", crate::devflow::DEV)])
+            .map(|s| s.lines().map(String::from).collect())
+            .unwrap_or_default();
+        let fm = o.final_message.clone().unwrap_or_default();
+        if status.starts_with("merged") {
+            dev.items.push(crate::devflow::Item {
+                pr: pr.rsplit('/').next().and_then(|n| n.parse().ok()).unwrap_or(0),
+                title: o.title.clone(),
+                url: pr.clone(),
+                human: false,
+                implemented: one_line(&fm),
+                decisions: crate::devflow::extract_section(&fm, &["decision"]),
+                assumptions: crate::devflow::extract_section(&fm, &["assumption"]),
+                files,
+                repair_attempts: o.repair_attempts,
+                human_checks: verdict.human_checks(),
+                repair_note: None,
+            });
+        } else {
+            dev.remaining.push(format!("{pr}（#{number}）はマージされていません: {status}"));
+        }
+    }
     let run_log = std::fs::read_to_string(&o.log_path).unwrap_or_default();
     let reviewed = Reviewed {
         model: crate::review::logged_model(&run_log).unwrap_or_else(|| "default".into()),
@@ -424,7 +603,26 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     let start = Instant::now();
     let mut history = History::default();
     let mut repaired: Vec<u64> = Vec::new();
+    let base = limits.base.clone();
+    let dev_mode = base.as_deref() == Some(crate::devflow::DEV);
+    let mut dev = DevState::default();
+    if dev_mode {
+        match dev_gate(&root) {
+            Ok((ok, head)) => {
+                dev.dev_green = ok;
+                dev.dev_head = head;
+                if !ok {
+                    dev.halt = Some("!!! dev tests FAIL at loop start; nothing is merged".into());
+                }
+            }
+            Err(e) => dev.halt = Some(format!("!!! could not test dev at loop start: {}", one_line(&e.to_string()))),
+        }
+    }
     loop {
+        if let Some(h) = &dev.halt {
+            report(&path, &format!("\nstopped: {h}\n"));
+            break;
+        }
         maintain(&path, &mut repaired).await;
         let board = fetch_board()?;
         let action = plan(&board, &history, &limits, start.elapsed());
@@ -433,7 +631,7 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             break;
         }
         history.iterations += 1;
-        let line = match do_iteration(&action, &mut history.attempted).await {
+        let line = match do_iteration(&action, &mut history.attempted, base.as_deref(), &mut dev).await {
             Ok((issue, model, verdict, pr, summary, reviewed)) => {
                 if !verdict.starts_with("FAIL") {
                     history.consecutive_failures = 0;
@@ -454,6 +652,11 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         };
         report(&path, &line);
     }
+    if dev_mode {
+        if let Err(e) = update_standing_pr(&dir, &root, &dev, &path) {
+            report(&path, &format!("- standing dev → main PR: !!! could not update: {}\n", one_line(&e.to_string())));
+        }
+    }
     println!("loop report: {}", path.display());
     Ok(())
 }
@@ -471,7 +674,7 @@ mod tests {
     }
 
     fn lim() -> Limits {
-        Limits { max_iterations: 3, max_failures: 2, budget: Duration::from_secs(100) }
+        Limits { max_iterations: 3, max_failures: 2, budget: Duration::from_secs(100), base: None }
     }
 
     #[test]
@@ -543,6 +746,9 @@ mod tests {
         let l = parse_args(&a).unwrap();
         assert_eq!((l.max_iterations, l.max_failures, l.budget.as_secs()), (2, 2, 600));
         assert!(parse_args(&["--bogus".to_string()]).is_err());
+        let b: Vec<String> = ["--base", "dev"].map(String::from).to_vec();
+        assert_eq!(parse_args(&b).unwrap().base.as_deref(), Some("dev"));
+        assert!(parse_args(&["--base".to_string()]).is_err());
         assert_eq!(issue_number_from_url("https://github.com/o/r/issues/42\n"), Some(42));
     }
 }

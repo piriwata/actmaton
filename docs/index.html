@@ -131,7 +131,7 @@
   </p>
   <p>
     人の役割は、個々の操作を承認することではありません。
-    <strong>方向を決める（steering）</strong>ことと、<strong>PR をマージするかどうか判断する</strong>ことだけです。
+    <strong>方向を決める（steering）</strong>ことと、<strong>dev → main の1回のマージを判断する</strong>ことだけです。
     それ以外の「課題を見つける → 実装する → テストする → PR を出す」は actmaton が自律的に回します。
   </p>
   <p>
@@ -145,7 +145,7 @@
 <p>登場人物は4つだけです。それぞれの担当を押さえれば、全体が読めます。</p>
 
 <div class="flow">
-  <div class="box"><b>あなた（人）</b>方向を決める。Issue コメントで舵を取り、PR のマージを判断する。</div>
+  <div class="box"><b>あなた（人）</b>方向を決める。Issue コメントで舵を取り、朝に dev → main のマージを1回だけ判断する。</div>
   <div class="arrow">→</div>
   <div class="box"><b>propose（監査役）</b>リポジトリを監査し、次のタスクを Issue として起票する。コードは書かない。</div>
   <div class="arrow">→</div>
@@ -155,7 +155,10 @@
 </div>
 
 <ul>
-  <li><strong>PR はドラフトで作られます。</strong> マージできるのは人だけです。actmaton が勝手にマージすることはありません。</li>
+  <li><strong>main は常に人のものです。dev は、テストが通っている間は自動です。</strong>
+    <code>--base dev</code> で動かした loop の PR は dev を対象にし、テストが通れば（マージコミットで）自動で dev に入ります。
+    dev のテストが落ちたら loop は止まり、それ以上マージしません。main へのマージは actmaton は絶対に行いません。
+    <code>--base</code> なしの従来の動作（ドラフト PR を出すだけ）は変わりません。</li>
   <li><strong>バックログと判断の記録は GitHub にあります。</strong> Issue がタスク、コメントが指示、PR が成果物、という役割分担です。</li>
   <li><strong>安全は「承認」ではなく「ガードレール」で確保します。</strong> 書き込み範囲の制限、シェルの検査、停止条件などが自動で働きます（<a href="#safety">安全装置</a>）。</li>
 </ul>
@@ -178,7 +181,7 @@
     <td>リポジトリを監査し、次のタスクを1件、GitHub Issue として起票します（ラベル <code>actmaton-proposal</code>）。コードは変更しません。監査の仕組みは<a href="#audit">propose の監査</a>を参照してください。</td>
   </tr>
   <tr>
-    <td><code>actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N]</code><span class="badge pending">PR #35 マージ待ち</span></td>
+    <td><code>actmaton loop [--max-iterations N] [--max-failures N] [--budget-minutes N] [--base dev]</code></td>
     <td>propose と run を自律的に繰り返します。テストが通った変更は push され、ドラフト PR が自動で開かれます。詳細は<a href="#loop">自律ループの仕組み</a>を参照してください。</td>
   </tr>
   <tr>
@@ -191,7 +194,7 @@
   <code>run</code> の引数は Issue 番号（<code>17</code> や <code>#17</code>）でも、Issue の URL でも構いません。
 </div>
 
-<h2 id="loop">自律ループの仕組み<span class="badge pending">PR #35 マージ待ち</span></h2>
+<h2 id="loop">自律ループの仕組み</h2>
 <p>
   <code>actmaton loop</code> は、人が1件ずつ指示しなくても開発が進み続けるためのコマンドです。
   各イテレーション（繰り返しの1回）で次のように動きます。
@@ -242,8 +245,17 @@
   チェックリストは <code>docs/review-checklist.md</code> にあり、過去の実際の失敗（<code>src/review.rs</code> のテスト用 fixture）を根拠にした項目だけが入ります。
   別モデル系列のレビュアー用プロンプトと、証拠のない finding を捨てるパーサも <code>src/review.rs</code> にありますが、レビュアーのセッション呼び出しはまだ loop に接続されていません。
 </p>
+<h3>dev モード（<code>actmaton loop --base dev</code>）</h3>
+<ul>
+  <li>issue の worktree は <code>origin/dev</code> から切られ、PR は dev を対象にします。<code>actmaton run &lt;issue&gt; --base dev</code> でも同じ起点になります（PR 作成は手動のまま）。</li>
+  <li>判定が PASS で、dev と衝突せず、dev のテストが通っているときだけ、ループ自身が PR を dev にマージします（squash なし）。</li>
+  <li>マージのたびに dev のテストを回し直します。落ちたらループは止まり、レポートに目立つ形で残ります。</li>
+  <li>ループの最後に、<code>dev → main</code> の「朝のまとめ」PR を作成または更新します。本文は日本語で、PR ごとに「やったこと／判断したこと／仮定したこと」と、残っている問題の一覧、dev のテスト状態、人が手を入れた割合を載せます。「特に注意／要確認／そのまま」に分けて並べます。</li>
+  <li><code>ACTMATON_YOMIYASU_DIR</code> に yomiyasu のスクリプトの場所を指定すると、本文に対して lint と check を実行し、結果をレポートに追記します。未指定の場合は、本文の冒頭にその旨を書き、文体ルールだけで作ります。</li>
+</ul>
 <div class="note">
-  ループが作る PR は<strong>ドラフト</strong>です。マージは常に行いません。マージは人の判断です。
+  main は常に人のものです。dev は、テストが通っている間は自動です。
+  main へのマージは、あなたが「朝のまとめ」PR を1回マージするだけです。
 </div>
 
 <h2 id="steering">Steering の方法</h2>
@@ -276,11 +288,11 @@
 </ul>
 
 <div class="note">
-  繰り返しになりますが、<strong>マージだけは常に行います（人）</strong>。
-  actmaton の権限の範囲は「ドラフト PR を出すところまで」です。
+  繰り返しになりますが、<strong>main は常に人のものです。dev は、テストが通っている間は自動です。</strong>
+  朝にやることは、「朝のまとめ」PR を読んで、dev → main をマージするかどうかを決めることだけです。
 </div>
 
-<h2 id="audit">propose の監査<span class="badge pending">PR #33 マージ待ち</span></h2>
+<h2 id="audit">propose の監査</h2>
 <p>
   <code>propose</code> は「次の機能を思いつく」仕組みではありません。コードベースを<strong>監査</strong>し、
   証拠のある課題だけを Issue 化する仕組みです。設計の参考は
@@ -348,7 +360,7 @@
     <td>同じ Issue を再実行したとき、前回の worktree やブランチが残っていた場合の処理です。綺麗で先行コミットが無ければ作り直しますが、<strong>変更が残っている・コミットが進んでいる場合は、実行を拒否して何も消しません</strong>。人の作業や前回の成果が自動で消える事故を防ぎます。</td>
   </tr>
   <tr>
-    <td>自己修復<span class="badge pending">PR #31 マージ待ち</span></td>
+    <td>自己修復</td>
     <td>実装後に <code>cargo test</code> が落ちたら、失敗出力を次のセッションに渡して直させる、というフィードバックループです。再試行は最大2回まで。直らなければ worktree を残したまま失敗として終了します。</td>
   </tr>
   <tr>
@@ -367,7 +379,7 @@
 </p>
 <div class="warn">
   つまり現状のシェル権限は「文字列ベースの判定＋ガード」という<strong>暫定</strong>の仕組みであり、OS サンドボックスの代替ではありません。
-  だからこそ今は、worktree スコープ、ドラフト PR、マージは人、という多層の決まりとセットで運用しています。
+  だからこそ今は、worktree スコープ、ドラフト PR、main は人（dev は green の間だけ自動）、という多層の決まりとセットで運用しています。
   上流の修正が出れば、サンドボックス方式へ移行する計画です。
 </div>
 
@@ -395,7 +407,7 @@
 <h3>設定の優先順位<span class="badge pending">フラグ化は Issue #36</span></h3>
 <ol>
   <li><strong>CLI フラグ</strong>（<code>--model</code> / <code>--fusion-tier</code>）— 導入予定（Issue #36）。</li>
-  <li><strong>環境変数</strong>（<code>ACTMATON_MODEL</code>、<code>ACTMATON_FUSION_TIER</code>、役割別の上書き）— 現行の仕組み。<span class="badge pending">PR #30 マージ待ち</span></li>
+  <li><strong>環境変数</strong>（<code>ACTMATON_MODEL</code>、<code>ACTMATON_FUSION_TIER</code>、役割別の上書き）— 現行の仕組み。</li>
   <li><strong>組み込みの既定値</strong>（上の表）。</li>
 </ol>
 <p>ログには、どの経路で決まった設定かも併せて記録されます。</p>
@@ -432,11 +444,11 @@
     <td>監査のプロンプトとモデルの応答、参照チェック・前提チェックの結果、発見ごとの処分（起票／見送り／却下）が入ります。</td>
   </tr>
   <tr>
-    <td><code>loop-&lt;時刻&gt;.md</code>（loop レポート）<span class="badge pending">PR #35 マージ待ち</span></td>
+    <td><code>loop-&lt;時刻&gt;.md</code>（loop レポート）</td>
     <td>loop のイテレーションごとの記録。Issue、モデル、合否、PR リンク、1行要約と、最後に止まった理由が入ります。</td>
   </tr>
   <tr>
-    <td><code>propose-ledger.jsonl</code>（却下台帳）<span class="badge pending">PR #33 マージ待ち</span></td>
+    <td><code>propose-ledger.jsonl</code>（却下台帳）</td>
     <td>vet で落とした発見とその理由の台帳。次回の propose が読み込み、再提案を防ぎます。</td>
   </tr>
 </table>
@@ -465,7 +477,7 @@
   <dd>Copilot のモデル自動振り分けの仕組み。ティアは Standard（Auto Balance：タスクに応じてモデルを選び、今回のテストでは gpt-6-luna が選ばれた）、High（HydraFusion）、Max（HydraFusion Max）があります。ただし High / Max は現在のアカウントでは使えません。</dd>
 
   <dt>自己修復（self-repair）</dt>
-  <dd>テストが落ちたとき、失敗出力を次のセッションへ渡して直させる仕組み。上限回数つきです（PR #31 マージ待ち）。</dd>
+  <dd>テストが落ちたとき、失敗出力を次のセッションへ渡して直させる仕組み。上限回数つきです。</dd>
 
   <dt>dogfooding（ドッグフーディング）</dt>
   <dd>自分の製品を自分で使うこと。actmaton は自分のリポジトリの開発に actmaton 自身を使い、その過程で弱点を洗い出しています。</dd>
@@ -481,8 +493,6 @@
     （対象は <code>actmaton 0.1.0</code> 系）。
   </p>
   <p>
-    <span class="badge pending">PR #xx マージ待ち</span> と付いている項目は、実装が完了し PR がレビュー待ちの状態にある機能です。
-    マージされるまでは、main ブランチの actmaton ではまだ使えません。
     <span class="badge done">PR #xx 実装済み</span> は main に取り込み済みの機能です。
   </p>
   <p>
