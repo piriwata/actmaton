@@ -129,6 +129,14 @@ pub fn pr_from_subject(subject: &str) -> Option<(u64, String)> {
 /// drop items no longer ahead, and add ahead PRs that entered dev by another route.
 pub fn merge_shipped(items: Vec<Item>, shipped: Vec<Item>) -> Vec<Item> {
     let mut out: Vec<Item> = items.into_iter().filter(|i| shipped.iter().any(|s| s.pr == i.pr)).collect();
+    // Closing issues come from live PR state; stored ones only fill in when live lookup found none.
+    for i in &mut out {
+        if let Some(s) = shipped.iter().find(|s| s.pr == i.pr) {
+            if !s.closes.is_empty() {
+                i.closes = s.closes.clone();
+            }
+        }
+    }
     for s in shipped {
         if !out.iter().any(|i| i.pr == s.pr) {
             out.push(Item { human: true, ..s });
