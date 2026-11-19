@@ -30,6 +30,8 @@ pub struct Artifacts<'a> {
     /// The branch was committed and pushed before the PR body was written.
     pub pushed: bool,
     pub issue_number: u64,
+    /// Whether a path exists on `origin/main` (checked against git).
+    pub on_main: &'a dyn Fn(&str) -> bool,
 }
 
 fn finding(class: &str, claim: &str, evidence: String) -> Finding {
@@ -101,6 +103,26 @@ pub fn check(a: &Artifacts) -> Vec<Finding> {
                 "report-run-log-mismatch",
                 "loop report model field differs from the model resolved in the run log",
                 format!("report `model: {field}` vs run log `resolved model: {real}`"),
+            ));
+        }
+    }
+
+    for l in a.final_message.lines() {
+        let low = l.to_lowercase();
+        if !["on main", "into main", "on `main`", "into `main`", "in main"].iter().any(|p| low.contains(p)) {
+            continue;
+        }
+        let missing: Vec<&str> = l
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !(c.is_alphanumeric() || "/_.-".contains(c))))
+            .filter(|t| t.contains('/') && t.contains('.') && !t.ends_with('.'))
+            .filter(|t| !(a.on_main)(t))
+            .collect();
+        if !missing.is_empty() {
+            out.push(finding(
+                "unverified-landing-claim",
+                "final message says a feature is on main, but git shows its files are not on origin/main",
+                format!("final message line: `{}`; absent from origin/main: {}", l.trim(), missing.join(", ")),
             ));
         }
     }
@@ -257,7 +279,21 @@ mod tests {
             verdict: "PASS",
             pushed: true,
             issue_number: 7,
+            on_main: &|_| true,
         }
+    }
+
+    #[test]
+    fn fixture_dev_feature_claimed_on_main() {
+        let a = Artifacts {
+            final_message: "- PASS caught\n- PASS cited\n- PASS tests pass\nThe dev flow is on main now: `src/devflow.rs`, PR #67.",
+            on_main: &|p| p != "src/devflow.rs",
+            ..base()
+        };
+        let f = check(&a);
+        assert_eq!(f[0].class, "unverified-landing-claim");
+        assert!(f[0].evidence.contains("src/devflow.rs"));
+        assert!(classes(&Artifacts { on_main: &|_| true, ..a }).is_empty());
     }
 
     fn classes(a: &Artifacts) -> Vec<String> {
@@ -320,6 +356,7 @@ mod tests {
             "closing-keyword",
             "missing-criterion-status",
             "unchecked-criterion-passed",
+            "unverified-landing-claim",
         ] {
             assert!(CHECKLIST.contains(c), "checklist lacks {c}");
         }
