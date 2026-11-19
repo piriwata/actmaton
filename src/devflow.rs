@@ -54,6 +54,38 @@ pub struct Item {
     pub human_checks: Vec<String>,
     /// What the orchestrator did on a human PR's behalf (conflict repair).
     pub repair_note: Option<String>,
+    /// Issues this PR closes; GitHub only auto-closes on the default branch,
+    /// so the standing PR repeats them.
+    pub closes: Vec<u64>,
+}
+
+/// Issue numbers named by closing keywords (`Closes #4`, `fixes #5`, `Resolved #6`).
+pub fn closes_with_retry<E: std::fmt::Display>(mut fetch: impl FnMut() -> Result<String, E>) -> Result<Vec<u64>, String> {
+    fetch()
+        .or_else(|_| fetch())
+        .map(|b| closing_issues(&b))
+        .map_err(|e| e.to_string())
+}
+
+/// Problems-section line for PRs whose closing-issue lookup failed.
+pub fn lookup_failure_note(failed: &[u64]) -> String {
+    let list: Vec<String> = failed.iter().map(|n| format!("#{n}")).collect();
+    format!("Closes の導出が不完全です: {} の本文を取得できませんでした", list.join(", "))
+}
+
+pub fn closing_issues(text: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for w in words.windows(2) {
+        let kw = w[0].trim_end_matches(':').to_lowercase();
+        let is_kw = ["close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved"].contains(&kw.as_str());
+        if let (true, Some(n)) = (is_kw, w[1].strip_prefix('#').and_then(|d| d.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<u64>().ok())) {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,6 +97,8 @@ pub struct Morning {
     pub iterations: u32,
     pub human_touches: u32,
     pub yomiyasu_note: Option<String>,
+    /// Repairs and escalations the loop performed on human PRs targeting dev.
+    pub human_notes: Vec<String>,
 }
 
 /// Text under the first heading/label line containing any of `names`
@@ -95,6 +129,37 @@ fn or_none(s: &str) -> &str {
     }
 }
 
+/// PR number and title from a commit subject such as `title (#12)` or
+/// `Merge pull request #12 from x/y`.
+pub fn pr_from_subject(subject: &str) -> Option<(u64, String)> {
+    let at = subject.find('#')?;
+    let digits: String = subject[at + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let pr = digits.parse().ok()?;
+    let title = subject[..at].trim_end().trim_end_matches('(').trim_end();
+    let title = if title.is_empty() || title.starts_with("Merge pull request") { subject } else { title };
+    Some((pr, title.to_string()))
+}
+
+/// Reconcile recorded loop items with the PRs actually in dev but not in main:
+/// drop items no longer ahead, and add ahead PRs that entered dev by another route.
+pub fn merge_shipped(items: Vec<Item>, shipped: Vec<Item>) -> Vec<Item> {
+    let mut out: Vec<Item> = items.into_iter().filter(|i| shipped.iter().any(|s| s.pr == i.pr)).collect();
+    // Closing issues come from live PR state; stored ones only fill in when live lookup found none.
+    for i in &mut out {
+        if let Some(s) = shipped.iter().find(|s| s.pr == i.pr) {
+            if !s.closes.is_empty() {
+                i.closes = s.closes.clone();
+            }
+        }
+    }
+    for s in shipped {
+        if !out.iter().any(|i| i.pr == s.pr) {
+            out.push(Item { human: true, ..s });
+        }
+    }
+    out
+}
+
 fn render_item(i: &Item) -> String {
     let who = if i.human { "（人が作成）" } else { "" };
     let mut s = format!("### #{} {}{}\n- リンク: {}\n", i.pr, i.title, who, i.url);
@@ -115,6 +180,55 @@ fn render_item(i: &Item) -> String {
     }
     s.push('\n');
     s
+}
+
+pub const NIHONGO_NOTE: &str = "nihongo を読み込めなかったため、この文章は文体ルールだけで書いています。";
+
+/// Prompt for the drafting session: the nihongo skill text plus the
+/// deterministic body, whose facts must be kept as they are.
+pub fn nihongo_prompt(skill: &str, body: &str) -> String {
+    format!(
+        "以下の日本語文章スキル（nihongo）に従って、PR 本文の日本語だけを読みやすく直してください。\n\
+         事実は変えないでください。PR 番号、リンク、コミット、数値、テストの状態、見出し、項目は、追加も削除もしません。\n\
+         返答は直した本文だけにしてください（前置きやコードフェンスは付けません）。\n\n\
+         ## スキル\n{skill}\n\n## 本文\n{body}\n"
+    )
+}
+
+fn fact_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in text.split(|c: char| c.is_whitespace() || "()（）、。：,".contains(c)) {
+        if w.starts_with("https://") || (w.starts_with('#') && w.len() > 1 && w[1..].chars().all(|c| c.is_ascii_digit())) {
+            out.push(w.to_string());
+        }
+    }
+    for (i, span) in text.split('`').enumerate() {
+        if i % 2 == 1 && !span.is_empty() {
+            out.push(format!("`{span}`"));
+        }
+    }
+    out
+}
+
+/// Whether every link, PR number and code span of `original` survives in `refined`.
+pub fn facts_preserved(original: &str, refined: &str) -> bool {
+    fact_tokens(original).iter().all(|t| refined.contains(t.as_str()))
+}
+
+/// Strip a wrapping code fence the session may add around the body.
+pub fn unfence(reply: &str) -> &str {
+    let t = reply.trim();
+    t.strip_prefix("```markdown")
+        .or_else(|| t.strip_prefix("```md"))
+        .or_else(|| t.strip_prefix("```"))
+        .and_then(|r| r.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(t)
+}
+
+/// Whether a standing PR body names `head` as its dev head (see `build_body`).
+pub fn body_names_head(body: &str, head: &str) -> bool {
+    body.contains(&format!("dev の最新: `{head}`"))
 }
 
 /// The standing dev → main PR body: plain Japanese, short sentences, bullets.
@@ -163,6 +277,23 @@ pub fn build_body(m: &Morning) -> String {
             s.push_str(&render_item(i));
         }
     }
+    if !m.human_notes.is_empty() {
+        s.push_str("## 人が作った PR に対して行ったこと\n");
+        for n in &m.human_notes {
+            s.push_str(&format!("- {n}\n"));
+        }
+        s.push('\n');
+    }
+    let mut closes: Vec<u64> = m.items.iter().flat_map(|i| i.closes.iter().copied()).collect();
+    closes.sort_unstable();
+    closes.dedup();
+    if !closes.is_empty() {
+        s.push_str("## このマージで閉じる Issue\n");
+        for n in closes {
+            s.push_str(&format!("Closes #{n}\n"));
+        }
+        s.push('\n');
+    }
     s.push_str("## 残っている問題と制限\n");
     if m.remaining.is_empty() {
         s.push_str("- 今回の実行では、記録された問題はありません。\n");
@@ -176,6 +307,30 @@ pub fn build_body(m: &Morning) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_closes_lookup_is_retried_then_surfaced() {
+        let mut calls = 0;
+        let ok = closes_with_retry(|| { calls += 1; if calls == 1 { Err("boom") } else { Ok("Closes #70".to_string()) } });
+        assert_eq!(ok, Ok(vec![70]));
+        let mut calls = 0;
+        let err = closes_with_retry(|| { calls += 1; Err::<String, _>("boom") });
+        assert_eq!((calls, err), (2, Err("boom".to_string())));
+        let m = Morning { remaining: vec![lookup_failure_note(&[78, 81])], ..Default::default() };
+        let body = build_body(&m);
+        assert!(body.contains("#78, #81") && !body.contains("記録された問題はありません"));
+    }
+
+    #[test]
+    fn nihongo_refinement_must_keep_facts() {
+        let body = "- dev の最新: `abc123`\n### #12 t\n- リンク: https://github.com/o/r/pull/12\n";
+        assert!(nihongo_prompt("SKILL", body).contains("SKILL"));
+        let ok = "- dev の最新は `abc123` です。\n### #12 t\n- リンク: https://github.com/o/r/pull/12\n";
+        assert!(facts_preserved(body, ok));
+        assert!(!facts_preserved(body, "- dev の最新は `abc123` です。\n### #12 t\n"));
+        assert!(!facts_preserved(body, "### #12 t\nhttps://github.com/o/r/pull/12"));
+        assert_eq!(unfence("```markdown\nx\n```"), "x");
+    }
 
     #[test]
     fn merge_only_when_all_conditions_hold() {
@@ -232,6 +387,56 @@ mod tests {
     }
 
     #[test]
+    fn body_lists_loop_merged_and_manually_merged_prs() {
+        let loop_item = Item { pr: 7, title: "ループの変更".into(), url: "https://example/pull/7".into(), files: vec!["docs/a.md".into()], ..Default::default() };
+        let (pr, title) = pr_from_subject("手動の変更 (#67)").unwrap();
+        let manual = Item { pr, title, url: "https://example/pull/67".into(), files: vec!["src/model.rs".into()], ..Default::default() };
+        let stale = Item { pr: 5, ..Default::default() };
+        let shipped = vec![loop_item.clone(), manual];
+        let items = merge_shipped(vec![loop_item, stale], shipped);
+        let b = build_body(&Morning { items, dev_green: true, ..Default::default() });
+        assert!(b.contains("取り込んだ PR: 2 件"), "{b}");
+        assert!(b.contains("### #7 ループの変更"), "{b}");
+        assert!(b.contains("### #67 手動の変更"), "{b}");
+        assert!(!b.contains("### #5 "), "{b}");
+    }
+
+    #[test]
+    fn body_closes_only_issues_of_promoted_prs() {
+        assert_eq!(closing_issues("Closes #44\n\nfixes #52, see #9"), vec![44, 52]);
+        let it = |pr, closes: Vec<u64>| Item { pr, closes, ..Default::default() };
+        let shipped = vec![it(67, vec![44]), it(68, vec![52]), it(74, vec![73])];
+        let stale = it(60, vec![10]);
+        let items = merge_shipped(vec![stale], shipped);
+        let b = build_body(&Morning { items, ..Default::default() });
+        for n in [44, 52, 73] {
+            assert!(b.contains(&format!("Closes #{n}\n")), "{b}");
+        }
+        assert!(!b.contains("Closes #10"), "{b}");
+        // Items recorded by an older binary carry no closes; live state fills them in.
+        let old = vec![it(78, vec![]), it(81, vec![])];
+        let live = vec![it(78, vec![70]), it(81, vec![76])];
+        let b = build_body(&Morning { items: merge_shipped(old, live), ..Default::default() });
+        assert!(b.contains("Closes #70\n") && b.contains("Closes #76\n"), "{b}");
+        assert!(!build_body(&Morning::default()).contains("Closes"));
+    }
+
+    #[test]
+    fn body_records_human_pr_repairs_and_escalations() {
+        let notes = vec!["#9: 競合を直しました".to_string(), "#10: 人の確認待ち".to_string()];
+        let b = build_body(&Morning { human_notes: notes, ..Default::default() });
+        assert!(b.contains("人が作った PR に対して行ったこと") && b.contains("#9: 競合") && b.contains("#10: 人の"), "{b}");
+        assert!(!build_body(&Morning::default()).contains("人が作った PR に対して"));
+    }
+
+    #[test]
+    fn body_staleness_detected_by_named_dev_head() {
+        let b = build_body(&Morning { dev_head: "abc123".into(), ..Default::default() });
+        assert!(body_names_head(&b, "abc123"));
+        assert!(!body_names_head(&b, "def456"));
+    }
+
+    #[test]
     fn morning_body_has_all_sections_in_japanese() {
         let m = Morning {
             items: vec![
@@ -260,6 +465,7 @@ mod tests {
             iterations: 4,
             human_touches: 1,
             yomiyasu_note: None,
+            human_notes: Vec::new(),
         };
         let b = build_body(&m);
         for needle in [
