@@ -199,14 +199,20 @@ async fn maintain(report_path: &Path, repaired: &mut Vec<u64>) {
     }
 }
 
+fn detach_checkout_args(sha: &str) -> [&str; 3] {
+    ["checkout", "--detach", sha]
+}
+
 /// Test the exact result GitHub would merge (`refs/pull/N/merge`) in a sibling worktree.
 fn human_pr_green(root: &Path, pr: u64) -> Result<bool, Box<dyn std::error::Error>> {
     git(root, &["fetch", "origin", &format!("refs/pull/{pr}/merge")])?;
+    // FETCH_HEAD is per-worktree, so resolve it here before using it in the sibling worktree.
+    let sha = git(root, &["rev-parse", "FETCH_HEAD"])?;
     let wt = root.parent().ok_or("repo root has no parent directory")?.join("actmaton-human-pr");
     if wt.exists() {
-        git(&wt, &["checkout", "--detach", "FETCH_HEAD"])?;
+        git(&wt, &detach_checkout_args(&sha))?;
     } else {
-        git(root, &["worktree", "add", "--detach", wt.to_str().ok_or("path is not UTF-8")?, "FETCH_HEAD"])?;
+        git(root, &["worktree", "add", "--detach", wt.to_str().ok_or("path is not UTF-8")?, &sha])?;
     }
     Ok(crate::run_loop::cargo_test(&wt).0)
 }
@@ -256,8 +262,18 @@ async fn maintain_human(root: &Path, report_path: &Path, repaired: &mut Vec<u64>
                         Ok(s) => s,
                         Err(e) => format!("!!! merge failed: {}", one_line(&e.to_string())),
                     },
-                    Ok(false) => "not merged: tests FAIL on the merge result".to_string(),
-                    Err(e) => format!("not merged: could not test: {}", one_line(&e.to_string())),
+                    Ok(false) => {
+                        let msg = "tests FAIL on the merge result".to_string();
+                        dev.human_notes.push((pr.number, format!("#{}: マージ結果のテストが失敗したためマージしませんでした。", pr.number)));
+                        dev.remaining.push(format!("人の PR #{}: マージ前テストが失敗しました", pr.number));
+                        format!("not merged: {msg}")
+                    }
+                    Err(e) => {
+                        let msg = one_line(&e.to_string());
+                        dev.human_notes.push((pr.number, format!("#{}: マージ前のテストを実行できずマージしませんでした: {msg}", pr.number)));
+                        dev.remaining.push(format!("人の PR #{}: マージ前のテストを実行できませんでした: {msg}", pr.number));
+                        format!("not merged: could not test: {msg}")
+                    }
                 };
                 report(report_path, &format!("- maintenance: human PR #{n} | {line}\n"));
             }
@@ -873,6 +889,24 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detach_checkout_works_in_sibling_worktree() {
+        let d = std::env::temp_dir().join(format!("actmaton-detach-{}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::create_dir_all(&d).unwrap();
+        let root = d.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]).unwrap();
+        git(&root, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "a"]).unwrap();
+        let wt = d.join("wt");
+        git(&root, &["worktree", "add", "--detach", wt.to_str().unwrap(), "HEAD"]).unwrap();
+        git(&root, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "b"]).unwrap();
+        let sha = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        git(&wt, &detach_checkout_args(&sha)).unwrap();
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), sha);
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     #[test]
     fn nihongo_skill_present_and_absent() {
