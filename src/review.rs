@@ -76,6 +76,11 @@ fn status_lines(message: &str) -> Vec<&str> {
     message
         .lines()
         .map(|l| l.trim().trim_start_matches(['-', '*', ' ']).trim_start_matches('[').trim())
+        .map(|l| match l.to_uppercase().strip_prefix("CRITERION") {
+            // the prompted form `CRITERION <n>: VERIFIED - ...`
+            Some(_) => l.split_once(':').map_or(l, |(_, rest)| rest.trim()),
+            None => l,
+        })
         .filter(|l| {
             let up = l.to_uppercase();
             STATUS_WORDS.iter().any(|w| up.starts_with(w))
@@ -344,6 +349,12 @@ mod tests {
     fn fixture_missing_criterion_status_lines() {
         let a = Artifacts { final_message: "All done, everything verified.", ..base() };
         assert_eq!(classes(&a), ["missing-criterion-status"]);
+    }
+
+    #[test]
+    fn prompted_criterion_lines_count_as_status_lines() {
+        let a = Artifacts { final_message: "CRITERION 1: VERIFIED - ran it\n- CRITERION 2: VERIFIED - ok\nCRITERION 3: VERIFIED - x", ..base() };
+        assert!(!classes(&a).contains(&"missing-criterion-status".to_string()));
     }
 
     #[test]
