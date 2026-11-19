@@ -373,6 +373,11 @@ mod tests {
             assert!(b.contains(&format!("Closes #{n}\n")), "{b}");
         }
         assert!(!b.contains("Closes #10"), "{b}");
+        // Items recorded by an older binary carry no closes; live state fills them in.
+        let old = vec![it(78, vec![]), it(81, vec![])];
+        let live = vec![it(78, vec![70]), it(81, vec![76])];
+        let b = build_body(&Morning { items: merge_shipped(old, live), ..Default::default() });
+        assert!(b.contains("Closes #70\n") && b.contains("Closes #76\n"), "{b}");
         assert!(!build_body(&Morning::default()).contains("Closes"));
     }
 
