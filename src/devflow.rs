@@ -60,6 +60,19 @@ pub struct Item {
 }
 
 /// Issue numbers named by closing keywords (`Closes #4`, `fixes #5`, `Resolved #6`).
+pub fn closes_with_retry<E: std::fmt::Display>(mut fetch: impl FnMut() -> Result<String, E>) -> Result<Vec<u64>, String> {
+    fetch()
+        .or_else(|_| fetch())
+        .map(|b| closing_issues(&b))
+        .map_err(|e| e.to_string())
+}
+
+/// Problems-section line for PRs whose closing-issue lookup failed.
+pub fn lookup_failure_note(failed: &[u64]) -> String {
+    let list: Vec<String> = failed.iter().map(|n| format!("#{n}")).collect();
+    format!("Closes の導出が不完全です: {} の本文を取得できませんでした", list.join(", "))
+}
+
 pub fn closing_issues(text: &str) -> Vec<u64> {
     let mut out = Vec::new();
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -280,6 +293,19 @@ pub fn build_body(m: &Morning) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_closes_lookup_is_retried_then_surfaced() {
+        let mut calls = 0;
+        let ok = closes_with_retry(|| { calls += 1; if calls == 1 { Err("boom") } else { Ok("Closes #70".to_string()) } });
+        assert_eq!(ok, Ok(vec![70]));
+        let mut calls = 0;
+        let err = closes_with_retry(|| { calls += 1; Err::<String, _>("boom") });
+        assert_eq!((calls, err), (2, Err("boom".to_string())));
+        let m = Morning { remaining: vec![lookup_failure_note(&[78, 81])], ..Default::default() };
+        let body = build_body(&m);
+        assert!(body.contains("#78, #81") && !body.contains("記録された問題はありません"));
+    }
 
     #[test]
     fn nihongo_refinement_must_keep_facts() {

@@ -461,6 +461,7 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
     let iterations = items.len() as u32;
     let human_touches = items.iter().filter(|i| i.human).count() as u32;
     let ahead = git(root, &["log", "origin/main..origin/dev", "--format=%H %s"])?;
+    let mut failed_lookups: Vec<u64> = Vec::new();
     let shipped: Vec<crate::devflow::Item> = ahead
         .lines()
         .filter_map(|l| {
@@ -469,9 +470,12 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
             let files = git(root, &["diff", "--name-only", &format!("{sha}^1"), sha])
                 .map(|o| o.lines().map(String::from).collect())
                 .unwrap_or_default();
-            let closes = gh(&["pr", "view", &pr.to_string(), "--repo", REPO, "--json", "body", "--jq", ".body"])
-                .map(|b| crate::devflow::closing_issues(&b))
-                .unwrap_or_default();
+            let closes = crate::devflow::closes_with_retry(|| gh(&["pr", "view", &pr.to_string(), "--repo", REPO, "--json", "body", "--jq", ".body"]))
+                .unwrap_or_else(|e| {
+                    report(report_path, &format!("- !!! closes lookup failed for PR #{pr}: {}\n", one_line(&e)));
+                    failed_lookups.push(pr);
+                    Vec::new()
+                });
             Some(crate::devflow::Item { pr, title, url: format!("https://github.com/{REPO}/pull/{pr}"), files, closes, ..Default::default() })
         })
         .collect();
@@ -488,6 +492,9 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
         items,
         yomiyasu_note: None,
     };
+    if !failed_lookups.is_empty() {
+        m.remaining.push(crate::devflow::lookup_failure_note(&failed_lookups));
+    }
     if let Some(h) = &dev.halt {
         m.remaining.insert(0, h.clone());
     }
