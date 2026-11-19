@@ -310,6 +310,11 @@ fn entry(iter: u32, issue: &str, model: &str, verdict: &str, pr: &str, summary: 
 fn self_review(dir: &Path, line: &str, verdict: &str, pr: &str, r: &Reviewed, issue: Option<u64>) -> String {
     use crate::review::{self, LedgerEntry};
     let n = issue.unwrap_or(0);
+    let root = crate::run_loop::repo_root().ok();
+    let on_main = |p: &str| match &root {
+        Some(r) => crate::run_loop::git(r, &["cat-file", "-e", &format!("origin/main:{p}")]).is_ok(),
+        None => true,
+    };
     let findings = review::check(&review::Artifacts {
         issue_body: &r.issue_body,
         final_message: &r.final_message,
@@ -320,6 +325,7 @@ fn self_review(dir: &Path, line: &str, verdict: &str, pr: &str, r: &Reviewed, is
         verdict,
         pushed: !pr.is_empty() && pr != "-",
         issue_number: n,
+        on_main: &on_main,
     });
     if findings.is_empty() {
         return String::new();

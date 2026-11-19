@@ -84,7 +84,7 @@ pub async fn run(issue_ref: &str, dry_run: bool, base: Option<&str>) -> Result<(
     println!("         {}", issue.url);
 
     if dry_run {
-        println!("\n== dry run: prompt ==\n{}", build_prompt(&issue));
+        println!("\n== dry run: prompt ==\n{}", build_prompt(&issue, base));
         println!("\n== dry run: permission policy ==\n{}", permission_policy_summary());
         println!("\ndry run: no worktree or Copilot session created, no message sent.");
         return Ok(());
@@ -140,7 +140,7 @@ async fn execute(issue: &Issue, repo_root: &Path, base: Option<&str>) -> Result<
     std::fs::create_dir_all(marker.parent().ok_or("no runs dir")?)?;
     std::fs::write(&marker, "")?;
 
-    let prompt = if adopted { build_inherit_prompt(issue) } else { build_prompt(issue) };
+    let prompt = if adopted { build_inherit_prompt(issue, base) } else { build_prompt(issue, base) };
     let (mut final_message, mut model) = run_session(issue, prompt, &worktree, &log).await?;
     if adopted {
         if let Some(why) = inheritance_rejection(final_message.as_deref()) {
@@ -154,7 +154,7 @@ async fn execute(issue: &Issue, repo_root: &Path, base: Option<&str>) -> Result<
             recovery = Some(line);
             Setup { branch, worktree, start, .. } = setup_worktree(repo_root, number, base, &log)?;
             std::fs::write(&marker, "")?;
-            (final_message, model) = run_session(issue, build_prompt(issue), &worktree, &log).await?;
+            (final_message, model) = run_session(issue, build_prompt(issue, base), &worktree, &log).await?;
         } else {
             recovery = recovery.map(|r| r.replace("pending inheriting-session review", "reviewed and owned by the inheriting session"));
         }
@@ -681,7 +681,7 @@ fn inheritance_rejection(message: Option<&str>) -> Option<String> {
     first.strip_prefix("REJECT:").map(|r| r.trim().to_string())
 }
 
-fn build_inherit_prompt(issue: &Issue) -> String {
+fn build_inherit_prompt(issue: &Issue, base: Option<&str>) -> String {
     format!(
         "NOTE: this worktree holds UNVERIFIED INHERITED WORK from a previous attempt that died \
          abnormally (no final message, no verdict). It passed `cargo test` and a scope check, \
@@ -690,7 +690,7 @@ fn build_inherit_prompt(issue: &Issue) -> String {
          apply and your final message must account for the whole diff. If the inherited work is \
          wrong or unusable, make no changes and start your final message with a line \
          `REJECT: <reasons>`; the orchestrator then discards it and starts clean.\n\n{}",
-        build_prompt(issue)
+        build_prompt(issue, base)
     )
 }
 
@@ -745,12 +745,16 @@ fn write_run_log(
 }
 
 /// The exact prompt sent to the agent (shared by the real run and `--dry-run`).
-fn build_prompt(issue: &Issue) -> String {
+fn build_prompt(issue: &Issue, base: Option<&str>) -> String {
     format!(
         "You are implementing a GitHub issue in an isolated git worktree of the \
          actmaton repository. Your current working directory is the worktree root.\n\n\
+         {branch}\
          Issue #{number}: {title}\n\n{body}\n\n{comments}\
          Rules:\n\
+         - Before asserting that a feature, file, or PR is \"on main\" (or on any branch) — in your \
+         work or your final message — verify it with git (e.g. `git branch -r --contains <commit>` or \
+         `git cat-file -e origin/main:<path>`); say \"on dev\" or \"unverified\" otherwise.\n\
          - Make all changes inside this worktree only. Do not read or write paths outside it.\n\
          - Do NOT run git push or gh commands. Commit work-in-progress at natural checkpoints \
          (e.g. after each coherent step, once it compiles) with `git add -A && git commit -m \"wip: <step>\" \
@@ -777,11 +781,22 @@ fn build_prompt(issue: &Issue) -> String {
          - If you truly cannot complete the task, say exactly what blocked you in your \
          final message instead of finishing silently.{criteria}",
         number = issue.number,
+        branch = branch_note(base),
         title = issue.title,
         body = issue.body,
         comments = comments_section(&issue.comments),
         criteria = criteria_prompt_section(&parse_criteria(&issue.body)),
     )
+}
+
+fn branch_note(base: Option<&str>) -> String {
+    match base {
+        Some(b) if b != "main" => format!(
+            "Base branch: `{b}` (not `main`). Features merged into `{b}` are NOT on `main`; \
+             this worktree's contents reflect `{b}`, so do not treat them as main's.\n\n"
+        ),
+        _ => "Base branch: `main`.\n\n".to_string(),
+    }
 }
 
 /// Human-readable description of `scoped_permission`'s policy.
@@ -1550,9 +1565,12 @@ mod tests {
             url: "u".into(),
             comments: vec![],
         };
-        let p = build_prompt(&issue);
+        let p = build_prompt(&issue, None);
         assert!(!p.contains("Issue comments"));
         assert!(p.contains("Issue #7: Do thing\n\nBody text"));
+        assert!(p.contains("Base branch: `main`."));
+        let d = build_prompt(&issue, Some("dev"));
+        assert!(d.contains("Base branch: `dev` (not `main`)") && d.contains("NOT on `main`"));
         assert!(p.contains("Do NOT run git push"));
         let s = permission_policy_summary();
         assert!(s.contains("read/write") && s.contains("shell") && s.contains("denied"));
@@ -1571,7 +1589,7 @@ mod tests {
             url: "u".into(),
             comments,
         };
-        let p = build_prompt(&issue);
+        let p = build_prompt(&issue, None);
         assert!(p.contains("## Issue comments (chronological)"));
         assert!(p.contains("the comment wins"));
         assert!(p.contains("6 older comment(s) omitted"));
