@@ -113,6 +113,8 @@ pub(crate) struct Outcome {
     pub log_path: PathBuf,
     pub criteria: Vec<String>,
     pub repair_attempts: u32,
+    /// Outcome of crash-leftover recovery, for the loop report.
+    pub recovery: Option<String>,
 }
 
 /// Run an issue by number: fetch it (fresh, so new comments are honored)
@@ -129,12 +131,34 @@ async fn execute(issue: &Issue, repo_root: &Path, base: Option<&str>) -> Result<
     let log: RunLog = Arc::new(Mutex::new(Vec::new()));
     log_line(&log, format!("issue #{}: {} ({})", issue.number, issue.title, issue.url));
 
-    let (branch, worktree) = setup_worktree(repo_root, number, base)?;
+    let Setup { mut branch, mut worktree, mut start, adopted, mut recovery } =
+        setup_worktree(repo_root, number, base, &log)?;
     println!("branch:   {branch}");
     println!("worktree: {}", worktree.display());
-    log_line(&log, format!("worktree created: {} (branch {branch})", worktree.display()));
+    log_line(&log, format!("worktree ready: {} (branch {branch})", worktree.display()));
+    let marker = in_progress_marker(repo_root, number)?;
+    std::fs::create_dir_all(marker.parent().ok_or("no runs dir")?)?;
+    std::fs::write(&marker, "")?;
 
-    let (mut final_message, mut model) = run_session(issue, build_prompt(issue), &worktree, &log).await?;
+    let prompt = if adopted { build_inherit_prompt(issue) } else { build_prompt(issue) };
+    let (mut final_message, mut model) = run_session(issue, prompt, &worktree, &log).await?;
+    if adopted {
+        if let Some(why) = inheritance_rejection(final_message.as_deref()) {
+            let patch = discard_leftover(repo_root, &worktree, &branch, &start, number)?;
+            let line = format!(
+                "recovered leftover for #{number}: discarded, inheriting session rejected it: {why}; saved as {}",
+                patch.display()
+            );
+            println!("{line}");
+            log_line(&log, line.clone());
+            recovery = Some(line);
+            Setup { branch, worktree, start, .. } = setup_worktree(repo_root, number, base, &log)?;
+            std::fs::write(&marker, "")?;
+            (final_message, model) = run_session(issue, build_prompt(issue), &worktree, &log).await?;
+        } else {
+            recovery = recovery.map(|r| r.replace("pending inheriting-session review", "reviewed and owned by the inheriting session"));
+        }
+    }
 
     // Post-session verification, run by us (not the agent).
     log_line(&log, format!("running cargo test in worktree (build settings: {})", build_settings_text()));
@@ -166,8 +190,11 @@ async fn execute(issue: &Issue, repo_root: &Path, base: Option<&str>) -> Result<
         log_line(&log, format!("tests still failing after {attempts} repair attempt(s); keeping worktree"));
     }
     let status = git(&worktree, &["status", "--porcelain"])?;
-    let diff_stat = git(&worktree, &["diff", "--stat", "HEAD"])?;
+    let diff_stat = git(&worktree, &["diff", "--stat", &start])?;
 
+    if let Some(r) = &recovery {
+        log_line(&log, format!("leftover recovery outcome: {r}"));
+    }
     let log_path = write_run_log(
         repo_root,
         issue,
@@ -177,6 +204,7 @@ async fn execute(issue: &Issue, repo_root: &Path, base: Option<&str>) -> Result<
         tests_ok,
         &test_tail,
     )?;
+    let _ = std::fs::remove_file(&marker);
 
     println!("\n================ run summary ================");
     println!("final message:");
@@ -187,7 +215,7 @@ async fn execute(issue: &Issue, repo_root: &Path, base: Option<&str>) -> Result<
     println!("worktree: {}", worktree.display());
     println!("changed files (git status --porcelain):");
     println!("{}", if status.trim().is_empty() { "  (none)" } else { &status });
-    println!("diff --stat vs HEAD:");
+    println!("diff --stat vs base:");
     println!("{}", if diff_stat.trim().is_empty() { "  (none)" } else { &diff_stat });
     println!("cargo test: {}", if tests_ok { "PASS" } else { "FAIL" });
     println!("--- cargo test output (tail) ---\n{test_tail}");
@@ -210,6 +238,7 @@ async fn execute(issue: &Issue, repo_root: &Path, base: Option<&str>) -> Result<
         log_path,
         criteria,
         repair_attempts: attempts,
+        recovery,
     })
 }
 
@@ -416,7 +445,9 @@ fn setup_worktree(
     repo_root: &Path,
     number: u64,
     base: Option<&str>,
-) -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
+    log: &RunLog,
+) -> Result<Setup, Box<dyn std::error::Error>> {
+    let mut recovery = None;
     let start = match base {
         Some(b) => {
             git(repo_root, &["fetch", "origin", b])?;
@@ -445,7 +476,22 @@ fn setup_worktree(
         } else {
             0
         };
-        match leftover_decision(dirty, ahead) {
+        let crashed = in_progress_marker(repo_root, number)?.exists();
+        match leftover_decision(dirty, ahead, crashed) {
+            Leftover::Recover => {
+                let sha = git(repo_root, &["rev-parse", &start])?;
+                let (adopted, why) = recover_leftover(repo_root, &worktree, &branch, &sha, number)?;
+                let line = format!(
+                    "recovered leftover for #{number}: {}, {why}",
+                    if adopted { "adopted (pending inheriting-session review)" } else { "discarded" }
+                );
+                println!("{line}");
+                log_line(log, line.clone());
+                if adopted {
+                    return Ok(Setup { branch, worktree, start: sha, adopted: true, recovery: Some(line) });
+                }
+                recovery = Some(line);
+            }
             Leftover::Recreate => {
                 println!("removing clean leftover worktree/branch for issue {number}");
                 if worktree.exists() {
@@ -493,26 +539,159 @@ fn setup_worktree(
         )
         .into());
     }
-    Ok((branch, worktree))
+    let start = git(repo_root, &["rev-parse", &start])?;
+    Ok(Setup { branch, worktree, start, adopted: false, recovery })
+}
+
+struct Setup {
+    branch: String,
+    worktree: PathBuf,
+    /// Commit the branch was (or must be) based on, for diffs that survive checkpoint commits.
+    start: String,
+    /// The tree is an inherited crash leftover that passed verification.
+    adopted: bool,
+    /// Loop-report line when a crash leftover was adopted or discarded.
+    recovery: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
 enum Leftover {
     Recreate,
+    Recover,
     Refuse(String),
 }
 
-/// Decide what to do with a leftover worktree/branch: only a clean one with
-/// no commits beyond the base may be discarded.
-fn leftover_decision(dirty: bool, ahead: u64) -> Leftover {
+/// Decide what to do with a leftover worktree/branch: a clean one with no
+/// commits beyond the base is discarded; a non-clean one is recovered
+/// (verify-and-adopt or discard) only when the previous attempt crashed;
+/// junk from a completed attempt is refused.
+fn leftover_decision(dirty: bool, ahead: u64, crashed: bool) -> Leftover {
     match (dirty, ahead) {
         (false, 0) => Leftover::Recreate,
+        _ if crashed => Leftover::Recover,
         (true, 0) => Leftover::Refuse("has uncommitted changes".into()),
         (false, n) => Leftover::Refuse(format!("has {n} commit(s) beyond the base")),
         (true, n) => Leftover::Refuse(format!(
             "has uncommitted changes and {n} commit(s) beyond the base"
         )),
     }
+}
+
+/// Marker present from worktree setup until the run log (the attempt's
+/// verdict record) is written; a leftover with the marker still present
+/// means the previous attempt died abnormally.
+fn in_progress_marker(repo_root: &Path, number: u64) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(repo_root
+        .parent()
+        .ok_or("repo root has no parent directory")?
+        .join("actmaton-runs")
+        .join(format!("issue-{number}.inprogress")))
+}
+
+const SCOPE_PATHS: [&str; 6] = ["src/", "tests/", "docs/", "README.md", "Cargo.toml", "Cargo.lock"];
+const MAX_SCOPE_FILES: usize = 40;
+
+/// Files outside the plausible scope of an issue implementation.
+fn scope_violations(files: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = files
+        .iter()
+        .filter(|f| !SCOPE_PATHS.iter().any(|p| f.starts_with(p)) || f.contains(".."))
+        .cloned()
+        .collect();
+    if files.len() > MAX_SCOPE_FILES {
+        out.push(format!("{} files changed (max {MAX_SCOPE_FILES})", files.len()));
+    }
+    out
+}
+
+/// Every path the leftover changes relative to `start`: committed, modified and untracked.
+fn leftover_files(worktree: &Path, start: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut files: Vec<String> = git(worktree, &["diff", "--name-only", start])?
+        .lines()
+        .chain(git(worktree, &["ls-files", "--others", "--exclude-standard"])?.lines())
+        .map(String::from)
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// Save the leftover as a patch under actmaton-runs, then remove its
+/// worktree and branch. Nothing is removed if the patch cannot be saved.
+fn discard_leftover(
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    start: &str,
+    number: u64,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = in_progress_marker(repo_root, number)?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or("no runs dir")?;
+    std::fs::create_dir_all(&dir)?;
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let patch = dir.join(format!("issue-{number}-discarded-{ts}.patch"));
+    if worktree.exists() {
+        git(worktree, &["add", "-A"])?;
+    }
+    let diff = git(worktree, &["diff", "--cached", "--binary", start])?;
+    std::fs::write(&patch, format!("{diff}\n"))?;
+    if worktree.exists() {
+        git(repo_root, &["worktree", "remove", "--force", worktree.to_str().ok_or("worktree path is not UTF-8")?])?;
+    }
+    git(repo_root, &["worktree", "prune"])?;
+    git(repo_root, &["branch", "-D", branch])?;
+    let _ = std::fs::remove_file(in_progress_marker(repo_root, number)?);
+    Ok(patch)
+}
+
+/// Verify a crash leftover: scope check, then `cargo test` on it. Returns
+/// (adopted, reason). A failed verification discards it (patch saved).
+fn recover_leftover(
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    start: &str,
+    number: u64,
+) -> Result<(bool, String), Box<dyn std::error::Error>> {
+    if !worktree.exists() {
+        git(repo_root, &["worktree", "add", worktree.to_str().ok_or("worktree path is not UTF-8")?, branch])?;
+    }
+    let files = leftover_files(worktree, start)?;
+    let reason = {
+        let bad = scope_violations(&files);
+        if bad.is_empty() {
+            let (ok, _) = cargo_test(worktree);
+            if ok {
+                return Ok((true, format!("cargo test green and {} changed file(s) in scope", files.len())));
+            }
+            "cargo test fails on the leftover".to_string()
+        } else {
+            format!("out of scope: {}", bad.join(", "))
+        }
+    };
+    let patch = discard_leftover(repo_root, worktree, branch, start, number)?;
+    Ok((false, format!("{reason}; saved as {}", patch.display())))
+}
+
+/// A session that rejects inherited work starts its final message with `REJECT: <reason>`.
+fn inheritance_rejection(message: Option<&str>) -> Option<String> {
+    let first = message?.lines().map(str::trim).find(|l| !l.is_empty())?;
+    first.strip_prefix("REJECT:").map(|r| r.trim().to_string())
+}
+
+fn build_inherit_prompt(issue: &Issue) -> String {
+    format!(
+        "NOTE: this worktree holds UNVERIFIED INHERITED WORK from a previous attempt that died \
+         abnormally (no final message, no verdict). It passed `cargo test` and a scope check, \
+         nothing more. Your job: review `git diff` against the base plus `git status` against \
+         the issue, complete whatever is missing, and OWN the result — the normal verdict rules \
+         apply and your final message must account for the whole diff. If the inherited work is \
+         wrong or unusable, make no changes and start your final message with a line \
+         `REJECT: <reasons>`; the orchestrator then discards it and starts clean.\n\n{}",
+        build_prompt(issue)
+    )
 }
 
 type RunLog = Arc<Mutex<Vec<String>>>;
@@ -554,7 +733,7 @@ fn write_run_log(
     let steps = log.lock().map(|l| l.join("\n")).unwrap_or_default();
     let text = format!(
         "issue #{} {}\n\n== steps and permission decisions ==\n{steps}\n\n\
-         == final message ==\n{}\n\n== diff --stat vs HEAD ==\n{diff_stat}\n\n\
+         == final message ==\n{}\n\n== diff --stat vs base ==\n{diff_stat}\n\n\
          == cargo test: {} ==\n{test_tail}\n",
         issue.number,
         issue.title,
@@ -573,7 +752,10 @@ fn build_prompt(issue: &Issue) -> String {
          Issue #{number}: {title}\n\n{body}\n\n{comments}\
          Rules:\n\
          - Make all changes inside this worktree only. Do not read or write paths outside it.\n\
-         - Do NOT run git commit, git push, or gh commands. Leave changes uncommitted.\n\
+         - Do NOT run git push or gh commands. Commit work-in-progress at natural checkpoints \
+         (e.g. after each coherent step, once it compiles) with `git add -A && git commit -m \"wip: <step>\" \
+         -m \"Progress: done: <...>. Next: <...>.\"`, so a crash leaves an inspectable branch. \
+         Never commit target/ or files outside the worktree.\n\
          - Keep the change minimal and focused on the issue's acceptance criteria.\n\
          - After implementing, run `cargo test` and make sure it passes before finishing.\n\n\
          Surgical-change rules:\n\
@@ -1329,10 +1511,34 @@ mod tests {
 
     #[test]
     fn leftover_decision_recreates_only_clean() {
-        assert_eq!(leftover_decision(false, 0), Leftover::Recreate);
-        assert!(matches!(leftover_decision(true, 0), Leftover::Refuse(_)));
-        assert!(matches!(leftover_decision(false, 2), Leftover::Refuse(_)));
-        assert!(matches!(leftover_decision(true, 2), Leftover::Refuse(_)));
+        assert_eq!(leftover_decision(false, 0, false), Leftover::Recreate);
+        assert!(matches!(leftover_decision(true, 0, false), Leftover::Refuse(_)));
+        assert!(matches!(leftover_decision(false, 2, false), Leftover::Refuse(_)));
+        assert!(matches!(leftover_decision(true, 2, false), Leftover::Refuse(_)));
+    }
+
+    #[test]
+    fn crash_leftover_is_recovered_not_refused() {
+        assert_eq!(leftover_decision(true, 0, true), Leftover::Recover);
+        assert_eq!(leftover_decision(false, 2, true), Leftover::Recover);
+        assert_eq!(leftover_decision(false, 0, true), Leftover::Recreate);
+    }
+
+    #[test]
+    fn scope_check_flags_out_of_scope_files() {
+        let ok = vec!["src/run_loop.rs".to_string(), "README.md".to_string()];
+        assert!(scope_violations(&ok).is_empty());
+        let bad = vec!["src/a.rs".to_string(), ".github/workflows/x.yml".to_string()];
+        assert_eq!(scope_violations(&bad), vec![".github/workflows/x.yml".to_string()]);
+        let many: Vec<String> = (0..41).map(|i| format!("src/f{i}.rs")).collect();
+        assert_eq!(scope_violations(&many).len(), 1);
+    }
+
+    #[test]
+    fn detects_inheritance_rejection() {
+        assert_eq!(inheritance_rejection(Some("\nREJECT: wrong approach\nmore")), Some("wrong approach".into()));
+        assert_eq!(inheritance_rejection(Some("Done.\nREJECT: x")), None);
+        assert_eq!(inheritance_rejection(None), None);
     }
 
     #[test]
@@ -1347,7 +1553,7 @@ mod tests {
         let p = build_prompt(&issue);
         assert!(!p.contains("Issue comments"));
         assert!(p.contains("Issue #7: Do thing\n\nBody text"));
-        assert!(p.contains("Do NOT run git commit"));
+        assert!(p.contains("Do NOT run git push"));
         let s = permission_policy_summary();
         assert!(s.contains("read/write") && s.contains("shell") && s.contains("denied"));
     }

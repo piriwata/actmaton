@@ -558,6 +558,10 @@ async fn do_iteration(
     let label = format!("#{number}");
     let o = run_number(number, base).await.map_err(|e| (label.clone(), e))?;
     let summary = one_line(o.final_message.as_deref().unwrap_or(""));
+    let summary = match &o.recovery {
+        Some(r) => format!("{r} | {summary}"),
+        None => summary,
+    };
     let model = o.model.clone().unwrap_or_else(|| "(not reported)".into());
     let verdict = decide_verdict(o.tests_ok, &o.criteria, o.final_message.as_deref());
     if verdict == Verdict::Fail {
