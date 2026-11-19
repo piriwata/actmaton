@@ -100,6 +100,19 @@ pub struct OpenPr {
     pub branch: String,
     pub base: String,
     pub mergeable: String,
+    pub draft: bool,
+    pub labels: Vec<String>,
+}
+
+const NEEDS_HUMAN_LABEL: &str = "needs-human";
+
+/// Human PRs that joined the dev flow by targeting dev: not actmaton's own
+/// branch, not a draft, and not already escalated.
+pub fn human_candidates(prs: &[OpenPr]) -> Vec<&OpenPr> {
+    prs.iter()
+        .filter(|p| p.base == crate::devflow::DEV && !p.branch.starts_with(BRANCH_PREFIX) && !p.draft)
+        .filter(|p| !p.labels.iter().any(|l| l == NEEDS_HUMAN_LABEL))
+        .collect()
 }
 
 /// Open PRs eligible for conflict repair: actmaton's own branches only,
@@ -116,7 +129,7 @@ fn fetch_open_prs() -> Result<Vec<OpenPr>, Box<dyn std::error::Error>> {
     let out = Command::new("gh")
         .args([
             "pr", "list", "--repo", REPO, "--state", "open", "--limit", "100", "--json",
-            "number,headRefName,baseRefName,mergeable",
+            "number,headRefName,baseRefName,mergeable,isDraft,labels",
         ])
         .output()?;
     if !out.status.success() {
@@ -131,6 +144,11 @@ fn fetch_open_prs() -> Result<Vec<OpenPr>, Box<dyn std::error::Error>> {
                     branch: p["headRefName"].as_str().unwrap_or_default().to_string(),
                     base: p["baseRefName"].as_str().unwrap_or("main").to_string(),
                     mergeable: p["mergeable"].as_str().unwrap_or_default().to_string(),
+                    draft: p["isDraft"].as_bool().unwrap_or(false),
+                    labels: p["labels"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|l| l["name"].as_str().map(String::from)).collect())
+                        .unwrap_or_default(),
                 })
                 .collect()
         })
@@ -178,6 +196,76 @@ async fn maintain(report_path: &Path, repaired: &mut Vec<u64>) {
         let _ = Command::new("gh")
             .args(["pr", "comment", &pr.number.to_string(), "--repo", REPO, "--body", &comment])
             .output();
+    }
+}
+
+/// Test the exact result GitHub would merge (`refs/pull/N/merge`) in a sibling worktree.
+fn human_pr_green(root: &Path, pr: u64) -> Result<bool, Box<dyn std::error::Error>> {
+    git(root, &["fetch", "origin", &format!("refs/pull/{pr}/merge")])?;
+    let wt = root.parent().ok_or("repo root has no parent directory")?.join("actmaton-human-pr");
+    if wt.exists() {
+        git(&wt, &["checkout", "--detach", "FETCH_HEAD"])?;
+    } else {
+        git(root, &["worktree", "add", "--detach", wt.to_str().ok_or("path is not UTF-8")?, "FETCH_HEAD"])?;
+    }
+    Ok(crate::run_loop::cargo_test(&wt).0)
+}
+
+/// Mark a human PR as needing the human and record it for the standing PR.
+fn escalate_human_pr(pr: u64, why: &str, dev: &mut DevState) {
+    let n = pr.to_string();
+    let _ = gh(&["label", "create", NEEDS_HUMAN_LABEL, "--repo", REPO, "--color", "d93f0b", "--description", "actmaton could not resolve this by itself"]);
+    let _ = gh(&["pr", "edit", &n, "--repo", REPO, "--add-label", NEEDS_HUMAN_LABEL]);
+    let _ = gh(&["pr", "comment", &n, "--repo", REPO, "--body", &format!("actmaton needs a human here: {why}\n\nNothing was pushed or resolved automatically.")]);
+    dev.human_notes.push((pr, format!("#{pr}: 競合を自動で直せなかったため、人の確認待ちにしました（`{NEEDS_HUMAN_LABEL}`）。{}", one_line(why))));
+}
+
+/// Human PRs targeting dev: repair conflicts by merging dev in (escalating the
+/// non-mechanical ones), and auto-merge green ones. Never edits their commits,
+/// closes them, or touches main.
+async fn maintain_human(root: &Path, report_path: &Path, repaired: &mut Vec<u64>, dev: &mut DevState) {
+    let Ok(prs) = fetch_open_prs() else { return };
+    let todo: Vec<OpenPr> = human_candidates(&prs).into_iter().cloned().collect();
+    for pr in todo {
+        match pr.mergeable.as_str() {
+            "CONFLICTING" if !repaired.contains(&pr.number) => {
+                repaired.push(pr.number);
+                match crate::run_loop::repair_conflict(pr.number, &pr.branch, &pr.base).await {
+                    Ok(o) if o.tests_ok && o.pushed => {
+                        let files = if o.files.is_empty() { "(none)".to_string() } else { o.files.join(", ") };
+                        let _ = gh(&["pr", "comment", &pr.number.to_string(), "--repo", REPO, "--body", &format!("actmaton merged `{}` into this branch (no rebase, no force-push).\n\nConflict files: {files}\nTests: PASS\n\nResolution:\n{}", pr.base, o.summary)]);
+                        dev.human_notes.push((pr.number, format!("#{}: `{}` をブランチにマージして競合を直しました（対象: {files}）。", pr.number, pr.base)));
+                        report(report_path, &format!("- maintenance: human PR #{} | conflicts: {files} | REPAIRED (dev merged in, pushed)\n", pr.number));
+                    }
+                    Ok(o) if o.tests_ok => {}
+                    Ok(o) => {
+                        report(report_path, &format!("- maintenance: human PR #{} | !!! ESCALATED needs-human | {}\n", pr.number, one_line(&o.summary)));
+                        escalate_human_pr(pr.number, &o.summary, dev);
+                    }
+                    Err(e) => {
+                        report(report_path, &format!("- maintenance: human PR #{} | !!! ESCALATED needs-human | {}\n", pr.number, one_line(&e.to_string())));
+                        escalate_human_pr(pr.number, &e.to_string(), dev);
+                    }
+                }
+            }
+            "MERGEABLE" if dev.dev_green && !dev.human_tried.contains(&pr.number) => {
+                dev.human_tried.push(pr.number);
+                let n = pr.number.to_string();
+                let line = match human_pr_green(root, pr.number) {
+                    Ok(true) => match merge_into_dev(&n, &Verdict::Pass, root, dev) {
+                        Ok(s) => s,
+                        Err(e) => format!("!!! merge failed: {}", one_line(&e.to_string())),
+                    },
+                    Ok(false) => "not merged: tests FAIL on the merge result".to_string(),
+                    Err(e) => format!("not merged: could not test: {}", one_line(&e.to_string())),
+                };
+                report(report_path, &format!("- maintenance: human PR #{n} | {line}\n"));
+            }
+            _ => {}
+        }
+        if dev.halt.is_some() {
+            break;
+        }
     }
 }
 
@@ -310,6 +398,11 @@ fn entry(iter: u32, issue: &str, model: &str, verdict: &str, pr: &str, summary: 
 fn self_review(dir: &Path, line: &str, verdict: &str, pr: &str, r: &Reviewed, issue: Option<u64>) -> String {
     use crate::review::{self, LedgerEntry};
     let n = issue.unwrap_or(0);
+    let root = crate::run_loop::repo_root().ok();
+    let on_main = |p: &str| match &root {
+        Some(r) => crate::run_loop::git(r, &["cat-file", "-e", &format!("origin/main:{p}")]).is_ok(),
+        None => true,
+    };
     let findings = review::check(&review::Artifacts {
         issue_body: &r.issue_body,
         final_message: &r.final_message,
@@ -320,6 +413,7 @@ fn self_review(dir: &Path, line: &str, verdict: &str, pr: &str, r: &Reviewed, is
         verdict,
         pushed: !pr.is_empty() && pr != "-",
         issue_number: n,
+        on_main: &on_main,
     });
     if findings.is_empty() {
         return String::new();
@@ -360,6 +454,10 @@ struct DevState {
     dev_green: bool,
     dev_head: String,
     halt: Option<String>,
+    /// (PR, note) for repairs/escalations on human PRs.
+    human_notes: Vec<(u64, String)>,
+    /// Human PRs already tested for auto-merge in this invocation.
+    human_tried: Vec<u64>,
 }
 
 fn gh(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
@@ -480,7 +578,21 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
         })
         .collect();
     let items = crate::devflow::merge_shipped(items, shipped);
-    std::fs::write(&store, serde_json::to_string(&items.iter().map(item_json).collect::<Vec<_>>())?)?;
+    let notes_store = dir.join("human-pr-notes.json");
+    let mut notes: Vec<(u64, String)> = std::fs::read_to_string(&notes_store)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    for n in &dev.human_notes {
+        if !notes.contains(n) {
+            notes.push(n.clone());
+        }
+    }
+    // Keep notes only for PRs still open or already in dev ahead of main.
+    if let Ok(open) = fetch_open_prs() {
+        notes.retain(|(pr, _)| items.iter().any(|i| i.pr == *pr) || open.iter().any(|p| p.number == *pr));
+    }
+    std::fs::write(&notes_store, serde_json::to_string(&notes)?)?;    std::fs::write(&store, serde_json::to_string(&items.iter().map(item_json).collect::<Vec<_>>())?)?;
 
     let nihongo = std::env::var("ACTMATON_NIHONGO_DIR").ok().and_then(|d| load_nihongo(Path::new(&d)));
     let mut m = Morning {
@@ -491,6 +603,7 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
         human_touches,
         items,
         yomiyasu_note: None,
+        human_notes: notes.into_iter().map(|(_, n)| n).collect(),
     };
     if !failed_lookups.is_empty() {
         m.remaining.push(crate::devflow::lookup_failure_note(&failed_lookups));
@@ -534,6 +647,41 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
     };
     report(report_path, &format!("- standing dev → main PR: {url}\n"));
     Ok(())
+}
+
+/// Maintenance: regenerate the standing PR body when dev has moved past the
+/// head it names (e.g. after a manual merge), in any loop mode.
+async fn refresh_stale_standing_pr(dir: &Path, root: &Path, report_path: &Path) {
+    let check = || -> Result<Option<String>, Box<dyn std::error::Error>> {
+        git(root, &["fetch", "origin", crate::devflow::DEV])?;
+        let head = git(root, &["rev-parse", "--short", "origin/dev"])?;
+        let body = gh(&["pr", "list", "--repo", REPO, "--base", "main", "--head", crate::devflow::DEV, "--state", "open", "--json", "body", "--jq", ".[0].body // empty"])?;
+        Ok(if body.is_empty() || crate::devflow::body_names_head(&body, &head) { None } else { Some(head) })
+    };
+    let head = match check() {
+        Ok(Some(x)) => x,
+        Ok(None) => return,
+        Err(e) => {
+            report(report_path, &format!("- maintenance: standing PR staleness check failed: {}\n", one_line(&e.to_string())));
+            return;
+        }
+    };
+    report(report_path, &format!("- maintenance: standing PR body is stale (dev is `{head}`, body names a different head); regenerating\n"));
+    let mut dev = DevState::default();
+    match dev_gate(root) {
+        Ok((ok, h)) => {
+            dev.dev_green = ok;
+            dev.dev_head = h;
+        }
+        Err(e) => {
+            report(report_path, &format!("- maintenance: !!! could not test dev; standing PR not refreshed: {}\n", one_line(&e.to_string())));
+            return;
+        }
+    }
+    match update_standing_pr(dir, root, &dev, report_path).await {
+        Ok(()) => report(report_path, &format!("- maintenance: standing PR body refreshed to dev `{}`\n", dev.dev_head)),
+        Err(e) => report(report_path, &format!("- maintenance: !!! standing PR refresh failed: {}\n", one_line(&e.to_string()))),
+    }
 }
 
 /// What the self-review needs from one passing iteration.
@@ -671,13 +819,21 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             Err(e) => dev.halt = Some(format!("!!! could not test dev at loop start: {}", one_line(&e.to_string()))),
         }
     }
+    if dev.halt.is_none() {
+        refresh_stale_standing_pr(&dir, &root, &path).await;
+    }
     loop {
         if let Some(h) = &dev.halt {
             report(&path, &format!("\nstopped: {h}\n"));
             break;
         }
         maintain(&path, &mut repaired).await;
-        let board = fetch_board()?;
+        if dev_mode {
+            maintain_human(&root, &path, &mut repaired, &mut dev).await;
+            if dev.halt.is_some() {
+                continue;
+            }
+        }        let board = fetch_board()?;
         let action = plan(&board, &history, &limits, start.elapsed());
         if let Action::Stop(reason) = &action {
             report(&path, &format!("\nstopped: {reason}\n"));
@@ -749,6 +905,8 @@ mod tests {
             branch: b.into(),
             base: "main".into(),
             mergeable: m.into(),
+            draft: false,
+            labels: Vec::new(),
         };
         let prs = vec![
             pr(1, "actmaton/issue-1", "CONFLICTING"),
@@ -760,6 +918,27 @@ mod tests {
         let nums = |r: Vec<&OpenPr>| r.iter().map(|p| p.number).collect::<Vec<_>>();
         assert_eq!(nums(repair_candidates(&prs, &[])), vec![1, 4]);
         assert_eq!(nums(repair_candidates(&prs, &[1])), vec![4]);
+    }
+
+    #[test]
+    fn human_candidates_are_open_non_draft_dev_prs_of_others() {
+        let pr = |n, b: &str, base: &str, draft, labels: &[&str]| OpenPr {
+            number: n,
+            branch: b.into(),
+            base: base.into(),
+            mergeable: "MERGEABLE".into(),
+            draft,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        };
+        let prs = vec![
+            pr(1, "alice/feat", "dev", false, &[]),
+            pr(2, "actmaton/issue-2", "dev", false, &[]),
+            pr(3, "bob/feat", "main", false, &[]),
+            pr(4, "carol/wip", "dev", true, &[]),
+            pr(5, "dan/feat", "dev", false, &["needs-human"]),
+        ];
+        let nums: Vec<u64> = human_candidates(&prs).iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![1]);
     }
 
     #[test]

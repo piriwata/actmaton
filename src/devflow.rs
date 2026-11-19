@@ -97,6 +97,8 @@ pub struct Morning {
     pub iterations: u32,
     pub human_touches: u32,
     pub yomiyasu_note: Option<String>,
+    /// Repairs and escalations the loop performed on human PRs targeting dev.
+    pub human_notes: Vec<String>,
 }
 
 /// Text under the first heading/label line containing any of `names`
@@ -224,6 +226,11 @@ pub fn unfence(reply: &str) -> &str {
         .unwrap_or(t)
 }
 
+/// Whether a standing PR body names `head` as its dev head (see `build_body`).
+pub fn body_names_head(body: &str, head: &str) -> bool {
+    body.contains(&format!("dev の最新: `{head}`"))
+}
+
 /// The standing dev → main PR body: plain Japanese, short sentences, bullets.
 pub fn build_body(m: &Morning) -> String {
     let mut s = String::from("# 朝のまとめ（dev → main）\n\n");
@@ -269,6 +276,13 @@ pub fn build_body(m: &Morning) -> String {
         for i in group {
             s.push_str(&render_item(i));
         }
+    }
+    if !m.human_notes.is_empty() {
+        s.push_str("## 人が作った PR に対して行ったこと\n");
+        for n in &m.human_notes {
+            s.push_str(&format!("- {n}\n"));
+        }
+        s.push('\n');
     }
     let mut closes: Vec<u64> = m.items.iter().flat_map(|i| i.closes.iter().copied()).collect();
     closes.sort_unstable();
@@ -408,6 +422,21 @@ mod tests {
     }
 
     #[test]
+    fn body_records_human_pr_repairs_and_escalations() {
+        let notes = vec!["#9: 競合を直しました".to_string(), "#10: 人の確認待ち".to_string()];
+        let b = build_body(&Morning { human_notes: notes, ..Default::default() });
+        assert!(b.contains("人が作った PR に対して行ったこと") && b.contains("#9: 競合") && b.contains("#10: 人の"), "{b}");
+        assert!(!build_body(&Morning::default()).contains("人が作った PR に対して"));
+    }
+
+    #[test]
+    fn body_staleness_detected_by_named_dev_head() {
+        let b = build_body(&Morning { dev_head: "abc123".into(), ..Default::default() });
+        assert!(body_names_head(&b, "abc123"));
+        assert!(!body_names_head(&b, "def456"));
+    }
+
+    #[test]
     fn morning_body_has_all_sections_in_japanese() {
         let m = Morning {
             items: vec![
@@ -436,6 +465,7 @@ mod tests {
             iterations: 4,
             human_touches: 1,
             yomiyasu_note: None,
+            human_notes: Vec::new(),
         };
         let b = build_body(&m);
         for needle in [
