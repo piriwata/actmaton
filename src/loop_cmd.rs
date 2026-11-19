@@ -584,13 +584,19 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
             let files = git(root, &["diff", "--name-only", &format!("{sha}^1"), sha])
                 .map(|o| o.lines().map(String::from).collect())
                 .unwrap_or_default();
-            let closes = crate::devflow::closes_with_retry(|| gh(&["pr", "view", &pr.to_string(), "--repo", REPO, "--json", "body", "--jq", ".body"]))
+            let mut pr_body = String::new();
+            let closes = crate::devflow::closes_with_retry(|| {
+                let b = gh(&["pr", "view", &pr.to_string(), "--repo", REPO, "--json", "body", "--jq", ".body"])?;
+                pr_body = b.clone();
+                Ok::<String, Box<dyn std::error::Error>>(b)
+            })
                 .unwrap_or_else(|e| {
                     report(report_path, &format!("- !!! closes lookup failed for PR #{pr}: {}\n", one_line(&e)));
                     failed_lookups.push(pr);
                     Vec::new()
                 });
-            Some(crate::devflow::Item { pr, title, url: format!("https://github.com/{REPO}/pull/{pr}"), files, closes, ..Default::default() })
+            let implemented = crate::devflow::pr_body_summary(&pr_body);
+            Some(crate::devflow::Item { pr, title, url: format!("https://github.com/{REPO}/pull/{pr}"), files, closes, implemented, ..Default::default() })
         })
         .collect();
     let items = crate::devflow::merge_shipped(items, shipped);
@@ -654,7 +660,9 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
             body = build_body(&m);
         }
     }
-    let title = "dev → main: 朝のまとめ";
+    let date = git(root, &["log", "-1", "--format=%cs", "origin/dev"]).unwrap_or_default();
+    let title = crate::devflow::build_title(date.trim(), m.items.len());
+    let title = title.as_str();
     let existing = gh(&["pr", "list", "--repo", REPO, "--base", "main", "--head", crate::devflow::DEV, "--state", "open", "--json", "number", "--jq", ".[0].number"])?;
     let url = if existing.is_empty() {
         gh(&["pr", "create", "--repo", REPO, "--base", "main", "--head", crate::devflow::DEV, "--title", title, "--body", &body])?

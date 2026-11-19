@@ -121,6 +121,33 @@ pub fn extract_section(text: &str, names: &[&str]) -> String {
     out.join(" / ")
 }
 
+/// A PR's own description as a summary: its summary-like section, else its
+/// first paragraph. Empty when the body has no prose.
+pub fn pr_body_summary(body: &str) -> String {
+    let named = extract_section(body, &["summary", "やったこと", "概要", "what"]);
+    if !named.is_empty() {
+        return named;
+    }
+    let mut out = Vec::new();
+    for line in body.lines().map(str::trim) {
+        let is_head = line.starts_with('#') || (line.starts_with("**") && line.ends_with("**"));
+        if is_head || line.starts_with("<!--") {
+            if out.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if line.is_empty() {
+            if out.is_empty() {
+                continue;
+            }
+            break;
+        }
+        out.push(line.trim_start_matches(['-', '*']).trim().to_string());
+    }
+    out.join(" / ")
+}
+
 fn or_none(s: &str) -> &str {
     if s.trim().is_empty() {
         "（記載なし）"
@@ -149,6 +176,9 @@ pub fn merge_shipped(items: Vec<Item>, shipped: Vec<Item>) -> Vec<Item> {
         if let Some(s) = shipped.iter().find(|s| s.pr == i.pr) {
             if !s.closes.is_empty() {
                 i.closes = s.closes.clone();
+            }
+            if i.implemented.trim().is_empty() {
+                i.implemented = s.implemented.clone();
             }
         }
     }
@@ -231,6 +261,11 @@ pub fn body_names_head(body: &str, head: &str) -> bool {
     body.contains(&format!("dev の最新: `{head}`"))
 }
 
+/// Standing PR title naming the batch: date and incorporated PR count.
+pub fn build_title(date: &str, count: usize) -> String {
+    format!("dev → main 昇格まとめ（{date}・{count}件）")
+}
+
 /// The standing dev → main PR body: plain Japanese, short sentences, bullets.
 pub fn build_body(m: &Morning) -> String {
     let mut s = String::from("# 朝のまとめ（dev → main）\n\n");
@@ -307,6 +342,28 @@ pub fn build_body(m: &Morning) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manually_merged_pr_summary_comes_from_its_body() {
+        let body = "## Summary\n\nAdds the retry flag.\n\n## Test plan\n- ran it\n";
+        assert_eq!(pr_body_summary(body), "Adds the retry flag.");
+        assert_eq!(pr_body_summary("Fixes the loop.\nSecond line.\n\n## Notes\nx"), "Fixes the loop. / Second line.");
+        assert_eq!(pr_body_summary("  \n## Test plan\n"), "");
+        let recorded = Item { pr: 84, ..Default::default() };
+        let shipped = Item { pr: 84, implemented: pr_body_summary(body), ..Default::default() };
+        let items = merge_shipped(vec![recorded], vec![shipped]);
+        let m = Morning { items, ..Default::default() };
+        let b = build_body(&m);
+        assert!(b.contains("- やったこと: Adds the retry flag."));
+        let session = Item { pr: 5, implemented: "session text".into(), ..Default::default() };
+        let kept = merge_shipped(vec![session], vec![Item { pr: 5, implemented: "other".into(), ..Default::default() }]);
+        assert_eq!(kept[0].implemented, "session text");
+    }
+
+    #[test]
+    fn title_names_the_batch() {
+        assert_eq!(build_title("2026-11-19", 13), "dev → main 昇格まとめ（2026-11-19・13件）");
+    }
 
     #[test]
     fn failed_closes_lookup_is_retried_then_surfaced() {
