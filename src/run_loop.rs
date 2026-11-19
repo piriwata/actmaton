@@ -1217,7 +1217,8 @@ fn build_repair_prompt(issue: &Issue, attempt: u32, test_output: &str) -> String
          apply: stay inside the worktree, no git commit/push/gh, edit files only with the \
          write/edit tools (never via shell), and use shell only for cargo build/test and \
          read-only inspection. Run `cargo test` before finishing, and end with a one-line \
-         summary of what you changed.",
+         summary of what you changed.{criteria}",
+        criteria = criteria_prompt_section(&parse_criteria(&issue.body)),
         number = issue.number,
         title = issue.title,
         max = MAX_REPAIR_ATTEMPTS,
