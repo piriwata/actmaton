@@ -20,6 +20,18 @@ GitHub Issues, PRs, and CI hold the backlog, decisions, and results. The initial
 
 `actmaton loop` records one verdict per iteration: **FAIL** when `cargo test` fails; **PASS** when tests pass and every item under the issue's "Done criteria"/"Acceptance" section is reported `VERIFIED` by the session (also when the issue states none); otherwise **PARTIAL**. The session must end with one `CRITERION <n>: VERIFIED|NOT-VERIFIED|HUMAN-CHECK - <how/why>` line per criterion; unaddressed criteria count as not verified. PARTIAL runs still open a draft PR, with the unverified criteria (marked `human-check` where not machine-checkable) listed in the loop report and PR body.
 
+### Leftover guard and crash recovery
+
+A run for issue N uses worktree `actmaton-issue-N` and branch `actmaton/issue-N`. A leftover from an earlier attempt is never silently trusted:
+
+- **Clean** leftover (no changes, no commits): removed and recreated.
+- **Junk from a completed attempt** (a run log was written) that is dirty or has commits: refused; nothing is deleted, a human decides.
+- **Crash leftover** (the run's `actmaton-runs/issue-N.inprogress` marker is still present, i.e. the attempt died before writing its run log/verdict) that is dirty or has commits: recovered without a human. The orchestrator checks the changed files against a plausible scope (`src/`, `tests/`, `docs/`, `README.md`, `Cargo.toml`, `Cargo.lock`; at most 40 files) and runs `cargo test` on it. If either fails, it is **discarded** (saved first as `actmaton-runs/issue-N-discarded-<ts>.patch`). If both pass, a fresh session **inherits** it, told it is unverified inherited work: it reviews the diff against the issue, completes what is missing, and owns the result under the normal verdict rules. A session that starts its final message with `REJECT: <reasons>` makes the orchestrator discard (patch saved) and start clean.
+
+Every outcome is written to the run log and the loop report as `recovered leftover for #N: adopted/discarded, <why>`.
+
+Sessions are asked to make checkpoint commits (`wip: <step>`, with a `Progress: done … Next …` note in the message body), so a crash leaves committed, inspectable branch state.
+
 ### Loop resource notes
 
 Memory, not CPU, is the binding constraint on small hosts (an 8 GB VM hit the OOM killer twice in unattended runs). The loop's own `cargo test` verification therefore runs with `CARGO_BUILD_JOBS=1` and `CARGO_PROFILE_DEV_DEBUG=0` by default, and the run log records the settings used. This trades wall time (slower builds) for lower peak memory. Set either variable in the environment to override it, e.g. `CARGO_BUILD_JOBS=8` on a roomy machine.
