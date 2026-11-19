@@ -224,6 +224,11 @@ pub fn unfence(reply: &str) -> &str {
         .unwrap_or(t)
 }
 
+/// Whether a standing PR body names `head` as its dev head (see `build_body`).
+pub fn body_names_head(body: &str, head: &str) -> bool {
+    body.contains(&format!("dev の最新: `{head}`"))
+}
+
 /// The standing dev → main PR body: plain Japanese, short sentences, bullets.
 pub fn build_body(m: &Morning) -> String {
     let mut s = String::from("# 朝のまとめ（dev → main）\n\n");
@@ -405,6 +410,13 @@ mod tests {
         let b = build_body(&Morning { items: merge_shipped(old, live), ..Default::default() });
         assert!(b.contains("Closes #70\n") && b.contains("Closes #76\n"), "{b}");
         assert!(!build_body(&Morning::default()).contains("Closes"));
+    }
+
+    #[test]
+    fn body_staleness_detected_by_named_dev_head() {
+        let b = build_body(&Morning { dev_head: "abc123".into(), ..Default::default() });
+        assert!(body_names_head(&b, "abc123"));
+        assert!(!body_names_head(&b, "def456"));
     }
 
     #[test]

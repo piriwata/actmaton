@@ -542,6 +542,41 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
     Ok(())
 }
 
+/// Maintenance: regenerate the standing PR body when dev has moved past the
+/// head it names (e.g. after a manual merge), in any loop mode.
+async fn refresh_stale_standing_pr(dir: &Path, root: &Path, report_path: &Path) {
+    let check = || -> Result<Option<String>, Box<dyn std::error::Error>> {
+        git(root, &["fetch", "origin", crate::devflow::DEV])?;
+        let head = git(root, &["rev-parse", "--short", "origin/dev"])?;
+        let body = gh(&["pr", "list", "--repo", REPO, "--base", "main", "--head", crate::devflow::DEV, "--state", "open", "--json", "body", "--jq", ".[0].body // empty"])?;
+        Ok(if body.is_empty() || crate::devflow::body_names_head(&body, &head) { None } else { Some(head) })
+    };
+    let head = match check() {
+        Ok(Some(x)) => x,
+        Ok(None) => return,
+        Err(e) => {
+            report(report_path, &format!("- maintenance: standing PR staleness check failed: {}\n", one_line(&e.to_string())));
+            return;
+        }
+    };
+    report(report_path, &format!("- maintenance: standing PR body is stale (dev is `{head}`, body names a different head); regenerating\n"));
+    let mut dev = DevState::default();
+    match dev_gate(root) {
+        Ok((ok, h)) => {
+            dev.dev_green = ok;
+            dev.dev_head = h;
+        }
+        Err(e) => {
+            report(report_path, &format!("- maintenance: !!! could not test dev; standing PR not refreshed: {}\n", one_line(&e.to_string())));
+            return;
+        }
+    }
+    match update_standing_pr(dir, root, &dev, report_path).await {
+        Ok(()) => report(report_path, &format!("- maintenance: standing PR body refreshed to dev `{}`\n", dev.dev_head)),
+        Err(e) => report(report_path, &format!("- maintenance: !!! standing PR refresh failed: {}\n", one_line(&e.to_string()))),
+    }
+}
+
 /// What the self-review needs from one passing iteration.
 struct Reviewed {
     model: String,
@@ -676,6 +711,9 @@ pub async fn run_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             }
             Err(e) => dev.halt = Some(format!("!!! could not test dev at loop start: {}", one_line(&e.to_string()))),
         }
+    }
+    if dev.halt.is_none() {
+        refresh_stale_standing_pr(&dir, &root, &path).await;
     }
     loop {
         if let Some(h) = &dev.halt {
