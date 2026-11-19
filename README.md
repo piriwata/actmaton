@@ -46,3 +46,4 @@ Measured limit: the single `rustc` compiling `github-copilot-sdk` peaks at about
 - [x] **M2 — Self-proposal:** Actmaton files its own improvement Issues; a human selects.
 - [x] **M3 — Repeated loop:** self-improvement becomes repeatable, with idempotency, bounded retries, and cost/time records.
 - [ ] **M4 — Autonomy and local models:** always-on operation, richer direction, and local model support for the 16 GB Apple Silicon target.
+- **Dev-branch flow (operations):** work that passes the gate auto-merges into the long-lived `dev` branch; a human promotes `dev` → `main` through one standing PR.
