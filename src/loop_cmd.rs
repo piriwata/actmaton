@@ -5,7 +5,9 @@
 //! not already been attempted in this loop invocation. If none exists,
 //! `propose` files a new issue, which becomes that iteration's work.
 //! After a non-failing run the branch is pushed and a *draft* PR is opened here,
-//! in the orchestrator process (never inside the agent session). Merging is
+//! in the orchestrator process (never inside the agent session). A finished
+//! iteration (PASS, or PARTIAL with only human-check items) is then marked
+//! ready for review and the report says so; PARTIAL-BLOCKED stays draft. Merging is
 //! left to the user, except in dev mode (`--base dev`): PRs target `dev` and a
 //! PASS iteration is merged into dev (merge commit) once dev stays green; a red
 //! dev stops the loop. The standing `dev` → `main` PR is only ever created or
@@ -767,7 +769,13 @@ async fn do_iteration(
         ),
         _ => summary,
     };
-    if base == Some(crate::devflow::DEV) {
+    if base != Some(crate::devflow::DEV) && (matches!(verdict, Verdict::Pass) || verdict.human_only()) {
+        let note = match gh(&["pr", "ready", &pr, "--repo", REPO]) {
+            Ok(_) => "PR marked ready for review".to_string(),
+            Err(e) => format!("!!! could not mark PR ready: {}", one_line(&e.to_string())),
+        };
+        summary = format!("{summary} | {note}");
+    } else if base == Some(crate::devflow::DEV) {
         let status = repo_root()
             .and_then(|root| merge_into_dev(&pr, &verdict, &root, dev))
             .unwrap_or_else(|e| format!("merge error: {}", one_line(&e.to_string())));
