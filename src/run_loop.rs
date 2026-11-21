@@ -1216,8 +1216,9 @@ fn build_repair_prompt(issue: &Issue, attempt: u32, test_output: &str) -> String
          tests just to make them pass unless the test itself is wrong. The same rules as before \
          apply: stay inside the worktree, no git commit/push/gh, edit files only with the \
          write/edit tools (never via shell), and use shell only for cargo build/test and \
-         read-only inspection. Run `cargo test` before finishing, and end with a one-line \
-         summary of what you changed.",
+         read-only inspection. Run `cargo test` before finishing; your final message is a \
+         one-line summary of what you changed followed by the per-criterion lines below.{criteria}",
+        criteria = criteria_prompt_section(&parse_criteria(&issue.body)),
         number = issue.number,
         title = issue.title,
         max = MAX_REPAIR_ATTEMPTS,
@@ -1388,8 +1389,10 @@ fn criteria_prompt_section(criteria: &[String]) -> String {
     format!(
         "\n\nStated done criteria (numbered):\n{list}\n\
          Check every criterion that can be checked mechanically (e.g. run the revert/negative \
-         check) instead of narrating it. Your final message MUST contain one line per criterion, \
-         exactly in the form `CRITERION <n>: VERIFIED - <how>`, `CRITERION <n>: NOT-VERIFIED - <why>`, \
+         check) instead of narrating it. This is a contract, not a suggestion: the final message is \
+         machine-checked, and any criterion without its line is graded not verified (PARTIAL). \
+         Even if you ran out of steps or could not finish, still end with the lines. Your final \
+         message MUST contain one line per criterion, exactly in the form `CRITERION <n>: VERIFIED - <how>`, `CRITERION <n>: NOT-VERIFIED - <why>`, \
          or `CRITERION <n>: HUMAN-CHECK - <why it is not machine-checkable>`. Never claim VERIFIED \
          for something you did not actually run."
     )
@@ -1439,6 +1442,13 @@ mod tests {
         assert_eq!(parse_criteria(body), vec!["A fails", "cargo test passes"]);
         assert!(parse_criteria("Plain issue\n- a bullet\n").is_empty());
         assert_eq!(parse_criteria("Done criteria:\n* x\n"), vec!["x"]);
+    }
+
+    #[test]
+    fn criteria_prompt_makes_status_lines_mandatory() {
+        let p = criteria_prompt_section(&["a".to_string()]);
+        assert!(p.contains("contract, not a suggestion") && p.contains("`CRITERION <n>: VERIFIED - <how>`"));
+        assert!(criteria_prompt_section(&[]).is_empty());
     }
 
     #[test]

@@ -18,7 +18,7 @@ GitHub Issues, PRs, and CI hold the backlog, decisions, and results. The initial
 
 ### Loop verdict
 
-`actmaton loop` records one verdict per iteration: **FAIL** when `cargo test` fails; **PASS** when tests pass and every item under the issue's "Done criteria"/"Acceptance" section is reported `VERIFIED` by the session (also when the issue states none); otherwise **PARTIAL**. The session must end with one `CRITERION <n>: VERIFIED|NOT-VERIFIED|HUMAN-CHECK - <how/why>` line per criterion; unaddressed criteria count as not verified. PARTIAL runs still open a draft PR, with the unverified criteria (marked `human-check` where not machine-checkable) listed in the loop report and PR body.
+`actmaton loop` records one verdict per iteration: **FAIL** when `cargo test` fails; **PASS** when tests pass and every item under the issue's "Done criteria"/"Acceptance" section is reported `VERIFIED` by the session (also when the issue states none); otherwise **PARTIAL**. The session must end with one `CRITERION <n>: VERIFIED|NOT-VERIFIED|HUMAN-CHECK - <how/why>` line per criterion; unaddressed criteria count as not verified. PRs are opened as drafts; a PASS (or human-check-only PARTIAL) run marks its PR ready for review as its final step and the loop report records it, while a PARTIAL with NOT-VERIFIED criteria stays draft. PARTIAL runs still open a PR, with the unverified criteria (marked `human-check` where not machine-checkable) listed in the loop report and PR body.
 
 ### Leftover guard and crash recovery
 

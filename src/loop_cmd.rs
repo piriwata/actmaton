@@ -5,7 +5,9 @@
 //! not already been attempted in this loop invocation. If none exists,
 //! `propose` files a new issue, which becomes that iteration's work.
 //! After a non-failing run the branch is pushed and a *draft* PR is opened here,
-//! in the orchestrator process (never inside the agent session). Merging is
+//! in the orchestrator process (never inside the agent session). A finished
+//! iteration (PASS, or PARTIAL with only human-check items) is then marked
+//! ready for review and the report says so; PARTIAL-BLOCKED stays draft. Merging is
 //! left to the user, except in dev mode (`--base dev`): PRs target `dev` and a
 //! PASS iteration is merged into dev (merge commit) once dev stays green; a red
 //! dev stops the loop. The standing `dev` → `main` PR is only ever created or
@@ -584,13 +586,19 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
             let files = git(root, &["diff", "--name-only", &format!("{sha}^1"), sha])
                 .map(|o| o.lines().map(String::from).collect())
                 .unwrap_or_default();
-            let closes = crate::devflow::closes_with_retry(|| gh(&["pr", "view", &pr.to_string(), "--repo", REPO, "--json", "body", "--jq", ".body"]))
+            let mut pr_body = String::new();
+            let closes = crate::devflow::closes_with_retry(|| {
+                let b = gh(&["pr", "view", &pr.to_string(), "--repo", REPO, "--json", "body", "--jq", ".body"])?;
+                pr_body = b.clone();
+                Ok::<String, Box<dyn std::error::Error>>(b)
+            })
                 .unwrap_or_else(|e| {
                     report(report_path, &format!("- !!! closes lookup failed for PR #{pr}: {}\n", one_line(&e)));
                     failed_lookups.push(pr);
                     Vec::new()
                 });
-            Some(crate::devflow::Item { pr, title, url: format!("https://github.com/{REPO}/pull/{pr}"), files, closes, ..Default::default() })
+            let implemented = crate::devflow::pr_body_summary(&pr_body);
+            Some(crate::devflow::Item { pr, title, url: format!("https://github.com/{REPO}/pull/{pr}"), files, closes, implemented, ..Default::default() })
         })
         .collect();
     let items = crate::devflow::merge_shipped(items, shipped);
@@ -654,7 +662,9 @@ async fn update_standing_pr(dir: &Path, root: &Path, dev: &DevState, report_path
             body = build_body(&m);
         }
     }
-    let title = "dev → main: 朝のまとめ";
+    let date = git(root, &["log", "-1", "--format=%cs", "origin/dev"]).unwrap_or_default();
+    let title = crate::devflow::build_title(date.trim(), m.items.len());
+    let title = title.as_str();
     let existing = gh(&["pr", "list", "--repo", REPO, "--base", "main", "--head", crate::devflow::DEV, "--state", "open", "--json", "number", "--jq", ".[0].number"])?;
     let url = if existing.is_empty() {
         gh(&["pr", "create", "--repo", REPO, "--base", "main", "--head", crate::devflow::DEV, "--title", title, "--body", &body])?
@@ -759,7 +769,13 @@ async fn do_iteration(
         ),
         _ => summary,
     };
-    if base == Some(crate::devflow::DEV) {
+    if base != Some(crate::devflow::DEV) && (matches!(verdict, Verdict::Pass) || verdict.human_only()) {
+        let note = match gh(&["pr", "ready", &pr, "--repo", REPO]) {
+            Ok(_) => "PR marked ready for review".to_string(),
+            Err(e) => format!("!!! could not mark PR ready: {}", one_line(&e.to_string())),
+        };
+        summary = format!("{summary} | {note}");
+    } else if base == Some(crate::devflow::DEV) {
         let status = repo_root()
             .and_then(|root| merge_into_dev(&pr, &verdict, &root, dev))
             .unwrap_or_else(|e| format!("merge error: {}", one_line(&e.to_string())));
