@@ -68,7 +68,9 @@ fn criteria(issue_body: &str) -> Vec<String> {
     out
 }
 
-const STATUS_WORDS: [&str; 7] = ["PASS", "FAIL", "PARTIAL", "UNCHECKED", "UNVERIFIED", "NOT VERIFIED", "VERIFIED"];
+const STATUS_WORDS: [&str; 10] = [
+    "PASS", "FAIL", "PARTIAL", "UNCHECKED", "UNVERIFIED", "NOT VERIFIED", "NOT-VERIFIED", "HUMAN CHECK", "HUMAN-CHECK", "VERIFIED",
+];
 const UNCHECKED_WORDS: [&str; 4] = ["UNCHECKED", "UNVERIFIED", "NOT VERIFIED", "PARTIAL"];
 
 /// Lines of the final message that start with a per-criterion status.
@@ -355,6 +357,15 @@ mod tests {
     fn prompted_criterion_lines_count_as_status_lines() {
         let a = Artifacts { final_message: "CRITERION 1: VERIFIED - ran it\n- CRITERION 2: VERIFIED - ok\nCRITERION 3: VERIFIED - x", ..base() };
         assert!(!classes(&a).contains(&"missing-criterion-status".to_string()));
+    }
+
+    #[test]
+    fn all_prompted_status_forms_count_as_status_lines() {
+        for s in ["VERIFIED", "NOT-VERIFIED", "NOT VERIFIED", "HUMAN-CHECK", "HUMAN CHECK"] {
+            let msg = format!("CRITERION 1: {s} - x\nCRITERION 2: {s} - y\nCRITERION 3: {s} - z");
+            let a = Artifacts { final_message: &msg, ..base() };
+            assert!(!classes(&a).contains(&"missing-criterion-status".to_string()), "{s}");
+        }
     }
 
     #[test]
