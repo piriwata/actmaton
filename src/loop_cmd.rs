@@ -501,10 +501,9 @@ fn dev_gate(root: &Path) -> Result<(bool, String), Box<dyn std::error::Error>> {
     Ok((crate::run_loop::cargo_test(&wt).0, head))
 }
 
-/// Ready the PR, merge it into dev (merge commit) if the decision allows, then
-/// re-test dev. A red dev sets `dev.halt`. Returns a short status for the report.
+/// Merge the PR into dev (merge commit) if the decision allows, marking it ready
+/// only then (a declined PR stays draft), then re-test dev. A red dev sets `dev.halt`. Returns a short status for the report.
 fn merge_into_dev(pr: &str, verdict: &Verdict, root: &Path, dev: &mut DevState) -> Result<String, Box<dyn std::error::Error>> {
-    let _ = gh(&["pr", "ready", pr, "--repo", REPO]);
     let (mut base, mut mergeable) = (String::new(), String::new());
     for _ in 0..6 {
         let v: Value = serde_json::from_str(&gh(&["pr", "view", pr, "--repo", REPO, "--json", "mergeable,baseRefName"])?)?;
@@ -518,6 +517,7 @@ fn merge_into_dev(pr: &str, verdict: &Verdict, root: &Path, dev: &mut DevState) 
     if !crate::devflow::should_merge(verdict, &base, &mergeable, dev.dev_green) {
         return Ok(format!("not merged (base={base}, mergeable={mergeable}, dev green={})", dev.dev_green));
     }
+    let _ = gh(&["pr", "ready", pr, "--repo", REPO]);
     gh(&["pr", "merge", pr, "--repo", REPO, "--merge"])?;
     let (ok, head) = dev_gate(root)?;
     dev.dev_green = ok;
